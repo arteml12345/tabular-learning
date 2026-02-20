@@ -1,0 +1,2106 @@
+# Development Plan: hybrid_embed
+
+## How to Use This Document
+
+This document contains the complete development plan broken into
+sequential tasks. Each task is designed to be self-contained enough
+to hand off to a developer (or AI coding agent) as a prompt.
+
+**Rules for agents executing tasks:**
+
+1. Read the referenced spec sections in `documentation/tech_task_improved.txt`
+   before starting.
+2. Respect all dependencies -- do not start a task until its
+   dependencies are marked complete.
+3. Every task must include unit tests as specified.
+4. All code uses numpy-style docstrings.
+5. Follow the testing guidelines from spec Section 19 (no fixtures,
+   no mocks, explicit data generation, print statements, assert
+   statements).
+6. No emojis in any code (project rule).
+7. After completing a task, run `pytest` on the new tests to verify
+   they pass.
+
+**Dependency graph (simplified):**
+
+```
+T01 (scaffolding)
+ |
+ +---> T02 (utils)
+ |      |
+ +---> T03 (config)
+ |      |
+ |      +---> T04 (validation) --+
+ |      |                        |
+ |      +---> T05 (schema) ------+
+ |      |                        |
+ |      +---> T06 (splits) ------+
+ |      |                        |
+ |      +---> T07 (preprocess) --+----> T10 (embed base)
+ |                               |       |
+ |                               |       +---> T11 (MLP)
+ |                               |       |
+ |                               |       +---> T12 (FT-Transformer)
+ |                               |       |
+ +---> T08 (metrics) ------------+       |
+ |                               |       v
+ +---> T09 (logger) ------------+---> T13 (model zoo)
+                                 |       |
+                                 |       v
+                                 +---> T14 (HPO spaces)
+                                 |       |
+                                 |       +---> T15 (embed search)
+                                 |       |
+                                 |       +---> T16 (classical search)
+                                 |       |
+                                 |       v
+                                 +---> T17 (runner)
+                                         |
+                                         +---> T18 (CLI)
+                                         |
+                                         +---> T19 (integration tests)
+```
+
+---
+---
+
+## PHASE 0: PROJECT FOUNDATION
+
+---
+
+### TASK T01: Project Scaffolding
+
+**Dependencies**: None
+**Spec reference**: Section 13 (Python Stack), Section 14 (Package Structure)
+
+**Objective**: Create the project directory structure, dependency files,
+and empty `__init__.py` files so the package is importable.
+
+**Deliverables**:
+
+1. `pyproject.toml` with:
+   - Project name: `hybrid_embed`
+   - python >= 3.10
+   - Dependencies (do NOT pin exact versions, use >= with minimum):
+     numpy, pandas, scikit-learn, scipy, pyyaml, torch, lightgbm,
+     xgboost, catboost, hyperopt, joblib
+   - Dev dependencies: pytest
+   - Optional dependencies group "benchmarks": openml
+
+2. Directory tree with empty `__init__.py` in every package:
+   ```
+   hybrid_embed/
+     __init__.py
+     data/
+       __init__.py
+     embed/
+       __init__.py
+       adapters/
+         __init__.py
+     classical/
+       __init__.py
+     hpo/
+       __init__.py
+     eval/
+       __init__.py
+     log/
+       __init__.py
+     cli/
+       __init__.py
+   tests/
+     __init__.py
+     data/
+       __init__.py
+     embed/
+       __init__.py
+     classical/
+       __init__.py
+     hpo/
+       __init__.py
+     eval/
+       __init__.py
+     log/
+       __init__.py
+   ```
+
+3. A minimal `README.md` (3-5 lines: project name, one-line
+   description, how to install with `pip install -e .`).
+
+4. A `.gitignore` for Python projects (include `runs/`, `*.pyc`,
+   `__pycache__/`, `.eggs/`, `*.egg-info/`, `dist/`, `build/`).
+
+**Acceptance criteria**:
+- `pip install -e .` succeeds
+- `import hybrid_embed` works without error
+- All sub-packages importable: `from hybrid_embed.data import *` etc.
+- `pytest tests/` runs (0 tests collected, no errors)
+
+---
+
+### TASK T02: Utility Functions (seed, device, timing)
+
+**Dependencies**: T01
+**Spec reference**: Section 7.2 (Device Management), Section 12
+(Reproducibility & Seed Management)
+
+**Objective**: Implement `hybrid_embed/utils.py` with three groups of
+utilities: seed management, device detection, and timing.
+
+**Deliverables**:
+- `hybrid_embed/utils.py`
+- `tests/test_utils.py`
+
+**Detailed requirements**:
+
+```
+Function: seed_everything(seed: int) -> None
+    Set random seed for Python random, numpy, torch (CPU + CUDA).
+    Parameters: seed (int)
+    Side effects: sets all random states
+
+Function: derive_seed(master_seed: int, offset: int) -> int
+    Derive a deterministic sub-seed.
+    Returns: (master_seed + offset) % (2**31)
+
+Function: get_device(preference: str = "auto") -> torch.device
+    Auto-detect best available device.
+    preference: "auto" | "cuda" | "mps" | "cpu"
+    "auto" priority: cuda > mps > cpu
+    If requested device unavailable, fall back to cpu with warning.
+    Returns: torch.device
+
+Class: Timer
+    Context manager for wall-clock timing.
+    Usage:
+        with Timer() as t:
+            do_stuff()
+        print(t.elapsed_seconds)
+    Attributes:
+        elapsed_seconds: float (set on __exit__)
+```
+
+**Testing requirements** (`tests/test_utils.py`):
+
+- `test_seed_everything_reproducibility`: call seed_everything(42),
+  generate torch tensor + numpy array; repeat with same seed, assert
+  identical. Repeat with different seed, assert different.
+- `test_derive_seed_deterministic`: same inputs give same output;
+  different offsets give different outputs.
+- `test_get_device_cpu`: call get_device("cpu"), assert result is
+  torch.device("cpu").
+- `test_get_device_auto`: call get_device("auto"), assert result is
+  a valid torch.device (just check it doesn't error).
+- `test_timer`: time a sleep(0.1), assert elapsed >= 0.1 and < 0.5.
+
+---
+
+### TASK T03: Configuration Dataclasses
+
+**Dependencies**: T01
+**Spec reference**: Section 0 (Goal), Section 2 (Pipeline Overview),
+Section 10 (Evaluation Protocol), Section 14 (Package Structure),
+Section 15 (Interfaces), Section 16 (Defaults)
+
+**Objective**: Implement `hybrid_embed/config.py` with all configuration
+and result dataclasses used throughout the framework.
+
+**Deliverables**:
+- `hybrid_embed/config.py`
+- `tests/test_config.py`
+
+**Detailed requirements**:
+
+Use Python `dataclasses` with `dataclasses.field` for defaults.
+All classes must have numpy-style docstrings.
+
+```
+@dataclass
+class Schema:
+    numeric_columns: list[str]
+    categorical_columns: list[str]
+    # columns dropped during validation (constant, all-NaN)
+    dropped_columns: list[str] = field(default_factory=list)
+
+@dataclass
+class TaskConfig:
+    task: str  # "binary", "multiclass", "regression"
+    target_column: str | None = None
+    # for binary: override positive class label
+    positive_class: Any = None
+
+@dataclass
+class BudgetConfig:
+    # Embedding HPO
+    embed_hpo_max_trials: int = 50
+    embed_max_epochs: int = 50
+    embed_patience: int = 8
+    embed_time_budget_seconds: float | None = None
+    # Classical HPO
+    classical_hpo_max_trials: int = 150
+    classical_time_budget_seconds: float | None = None
+
+@dataclass
+class RunConfig:
+    n_folds: int = 5
+    master_seed: int = 42
+    device: str = "auto"          # "auto"|"cuda"|"mps"|"cpu"
+    deterministic: bool = False
+    save_embeddings: bool = False
+    save_predictions: bool = True
+    output_dir: str = "runs"
+    dataset_id: str = "default"
+    # Scaler choice
+    scaler: str = "standard"      # "standard" | "robust"
+    # Cardinality cap for categoricals
+    max_categorical_cardinality: int = 1000
+    # Proxy model for embedding HPO
+    proxy_model: str = "linear"   # "linear" | "lightgbm"
+    # Embedding model type(s) to search
+    embedding_models: list[str] = field(
+        default_factory=lambda: ["mlp"]
+    )
+    # Missingness indicator toggle
+    add_missing_indicator: bool = False
+
+@dataclass
+class FoldResult:
+    fold_index: int
+    metrics: dict[str, float]
+    # populated if save_predictions is True
+    predictions: np.ndarray | None = None
+    embedding_dim: int = 0
+
+@dataclass
+class RunResult:
+    task: str
+    dataset_id: str
+    n_folds: int
+    fold_results: list[FoldResult]
+    # aggregated
+    mean_metrics: dict[str, float]
+    std_metrics: dict[str, float]
+    best_embedding_config: dict
+    best_classical_config: dict
+    total_time_seconds: float
+```
+
+Implement a helper function:
+```
+def validate_task_config(task_config: TaskConfig) -> None:
+    """Raise ValueError if task is not one of the allowed values."""
+```
+
+Implement serialization helpers:
+```
+def config_to_dict(config) -> dict:
+    """Convert any config dataclass to a JSON-serializable dict."""
+
+def save_config_yaml(config, path: str) -> None:
+    """Save config to a YAML file."""
+```
+
+**Testing requirements** (`tests/test_config.py`):
+
+- `test_schema_creation`: create Schema with known columns, assert
+  fields are correct.
+- `test_budget_config_defaults`: create BudgetConfig() with no args,
+  assert all defaults match spec Section 16.
+- `test_run_config_defaults`: create RunConfig() with no args, assert
+  defaults.
+- `test_validate_task_config_valid`: validate "binary", "multiclass",
+  "regression" -- no error.
+- `test_validate_task_config_invalid`: validate "ranking" -- assert
+  ValueError raised.
+- `test_config_to_dict_roundtrip`: create a config, convert to dict,
+  check keys and values.
+- `test_save_config_yaml`: save to tmp file, read back, verify content.
+
+---
+---
+
+## PHASE 1: DATA LAYER
+
+---
+
+### TASK T04: Data Validation
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 4 (Data Validation)
+
+**Objective**: Implement `hybrid_embed/data/validation.py` with
+defensive checks that run before any processing.
+
+**Deliverables**:
+- `hybrid_embed/data/validation.py`
+- `tests/data/test_validation.py`
+
+**Detailed requirements**:
+
+```
+@dataclass
+class ValidationReport:
+    dropped_constant_columns: list[str]
+    dropped_allnan_columns: list[str]
+    warnings: list[str]
+    n_rows: int
+    n_cols_original: int
+    n_cols_after: int
+
+def validate_dataframe(
+    X: pd.DataFrame,
+    y: pd.Series | np.ndarray,
+    task: str,
+) -> tuple[pd.DataFrame, ValidationReport]:
+    """Validate input data and return cleaned DataFrame + report.
+
+    Checks performed:
+    1. X must have > 0 rows and > 0 columns.
+    2. y must have no NaN values.
+    3. len(X) must equal len(y).
+    4. For classification tasks: y must have >= 2 unique classes.
+    5. For binary task: y must have exactly 2 unique classes.
+    6. Drop constant columns (zero variance) with warning.
+    7. Drop all-NaN columns with warning.
+    8. After drops, X must still have > 0 columns.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+    y : pd.Series or np.ndarray
+    task : str
+        One of "binary", "multiclass", "regression".
+
+    Returns
+    -------
+    X_clean : pd.DataFrame
+        With problematic columns removed.
+    report : ValidationReport
+
+    Raises
+    ------
+    ValueError
+        If any hard check fails (empty data, NaN in y, wrong class
+        count, etc.)
+    """
+```
+
+Also implement:
+```
+def save_validation_report(report: ValidationReport, path: str) -> None:
+    """Save validation report to JSON."""
+```
+
+**Testing requirements** (`tests/data/test_validation.py`):
+
+- `test_valid_data_passes`: create clean DataFrame (50 rows, 3
+  numeric + 1 categorical column) with valid y. Assert returns
+  unchanged X and clean report.
+- `test_drops_constant_column`: add a column with all same values.
+  Assert it is dropped and listed in report.
+- `test_drops_allnan_column`: add a column with all NaN. Assert
+  it is dropped and listed in report.
+- `test_raises_on_nan_target`: y with NaN values. Assert ValueError.
+- `test_raises_on_empty_dataframe`: empty DataFrame. Assert ValueError.
+- `test_raises_on_length_mismatch`: len(X) != len(y). Assert ValueError.
+- `test_raises_on_single_class_binary`: binary task with only 1 unique
+  class in y. Assert ValueError.
+- `test_raises_on_wrong_class_count_binary`: binary task with 3 classes.
+  Assert ValueError.
+- `test_multiclass_allows_many_classes`: multiclass task with 5 classes.
+  Assert no error.
+- `test_regression_allows_any_y`: regression task with continuous y.
+  Assert no error.
+
+---
+
+### TASK T05: Schema Inference
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 2.1 (stage 2), Section 14
+
+**Objective**: Implement `hybrid_embed/data/schema.py` that
+automatically determines which columns are numeric and which are
+categorical.
+
+**Deliverables**:
+- `hybrid_embed/data/schema.py`
+- `tests/data/test_schema.py`
+
+**Detailed requirements**:
+
+```
+def infer_schema(
+    X: pd.DataFrame,
+    categorical_threshold: int = 20,
+) -> Schema:
+    """Infer column types from a DataFrame.
+
+    Rules:
+    1. Columns with dtype object or category -> categorical.
+    2. Columns with dtype bool -> categorical.
+    3. Integer columns with <= categorical_threshold unique values
+       -> categorical (heuristic for encoded categoricals).
+    4. All remaining numeric columns (int, float) -> numeric.
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+        Already validated (no constant or all-NaN columns).
+    categorical_threshold : int, default 20
+        Integer columns with <= this many unique values are treated
+        as categorical.
+
+    Returns
+    -------
+    Schema
+    """
+```
+
+**Testing requirements** (`tests/data/test_schema.py`):
+
+- `test_string_columns_are_categorical`: DataFrame with object columns.
+  Assert they appear in schema.categorical_columns.
+- `test_float_columns_are_numeric`: DataFrame with float columns.
+  Assert they appear in schema.numeric_columns.
+- `test_low_cardinality_int_is_categorical`: integer column with 5
+  unique values. Assert categorical.
+- `test_high_cardinality_int_is_numeric`: integer column with 100
+  unique values. Assert numeric.
+- `test_bool_columns_are_categorical`: bool column. Assert categorical.
+- `test_mixed_dataframe`: DataFrame with a mix. Assert correct split.
+- `test_categorical_threshold_parameter`: same column, different
+  thresholds yield different classification.
+
+---
+
+### TASK T06: Split Generation
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 8.1 (CV + HPO interaction), Section 10.1
+(Splits), Section 12 (Reproducibility)
+
+**Objective**: Implement `hybrid_embed/data/splits.py` for generating
+K-fold CV splits and single train/val/test splits.
+
+**Deliverables**:
+- `hybrid_embed/data/splits.py`
+- `tests/data/test_splits.py`
+
+**Detailed requirements**:
+
+```
+@dataclass
+class FoldSplit:
+    fold_index: int
+    train_indices: np.ndarray
+    val_indices: np.ndarray
+    test_indices: np.ndarray
+
+def generate_cv_splits(
+    y: np.ndarray,
+    n_folds: int = 5,
+    task: str = "regression",
+    master_seed: int = 42,
+    val_fraction: float = 0.15,
+) -> list[FoldSplit]:
+    """Generate K-fold cross-validation splits.
+
+    For each fold:
+    - test_indices = the fold's held-out portion (from KFold/
+      StratifiedKFold)
+    - The remaining indices are further split into train and val
+      using val_fraction
+    - val is used for early stopping during training
+
+    For classification tasks, use StratifiedKFold to preserve class
+    distribution. For regression, use KFold.
+
+    Fold 0 is designated as the HPO split (this is just a convention;
+    the runner will use fold_splits[0] for HPO).
+
+    Parameters
+    ----------
+    y : np.ndarray
+    n_folds : int
+    task : str
+    master_seed : int
+    val_fraction : float
+        Fraction of the non-test data to use as validation within
+        each fold.
+
+    Returns
+    -------
+    list[FoldSplit] of length n_folds
+    """
+
+def generate_single_split(
+    y: np.ndarray,
+    task: str = "regression",
+    train_fraction: float = 0.7,
+    val_fraction: float = 0.15,
+    master_seed: int = 42,
+) -> FoldSplit:
+    """Generate a single train/val/test split.
+
+    For quick debugging. Returns a single FoldSplit with fold_index=0.
+    """
+```
+
+**Testing requirements** (`tests/data/test_splits.py`):
+
+- `test_cv_splits_correct_count`: 5-fold CV produces 5 FoldSplit
+  objects.
+- `test_cv_splits_no_test_overlap`: test indices across folds are
+  disjoint and cover all samples.
+- `test_cv_splits_train_val_disjoint`: within each fold, train and
+  val indices are disjoint.
+- `test_cv_splits_no_leak_to_test`: within each fold, neither train
+  nor val indices overlap with test.
+- `test_cv_splits_stratified_classification`: for binary y with
+  imbalance (70/30), assert each fold's test set has approximately
+  the same class ratio.
+- `test_cv_splits_reproducible`: same seed produces identical splits.
+- `test_cv_splits_different_seed`: different seed produces different
+  splits.
+- `test_single_split_fractions`: assert approximate size of each set.
+- `test_single_split_no_overlap`: train, val, test are disjoint.
+
+---
+
+### TASK T07: Preprocessing
+
+**Dependencies**: T01, T03, T05
+**Spec reference**: Section 5 (Target Variable Handling), Section 6
+(Minimal Preprocessing)
+
+**Objective**: Implement `hybrid_embed/data/preprocess.py` with
+all preprocessing logic: numeric scaling, missing value imputation,
+categorical encoding, and target variable handling.
+
+**Deliverables**:
+- `hybrid_embed/data/preprocess.py`
+- `tests/data/test_preprocess.py`
+
+**Detailed requirements**:
+
+The preprocessor must be fitted on training data only, then applied
+(transformed) to val/test data. This is the sklearn fit/transform
+pattern.
+
+```
+class TabularPreprocessor:
+    """Preprocess tabular data for embedding model consumption.
+
+    Fitted on training data only. Transforms train/val/test
+    consistently.
+
+    Parameters
+    ----------
+    schema : Schema
+        Inferred column types.
+    scaler_type : str, default "standard"
+        "standard" or "robust".
+    max_categorical_cardinality : int, default 1000
+        Cap vocabulary for high-cardinality categoricals.
+    add_missing_indicator : bool, default False
+        If True, add binary indicator columns for missingness.
+    """
+
+    def fit(self, X_train: pd.DataFrame, y_train: np.ndarray = None) -> "TabularPreprocessor":
+        """Fit preprocessor on training data.
+
+        Learns:
+        - Median per numeric column (for imputation)
+        - Scaler parameters (StandardScaler or RobustScaler)
+        - Vocabulary per categorical column (with cardinality cap)
+        - Target encoder/scaler (if y_train provided)
+
+        Returns self.
+        """
+
+    def transform(self, X: pd.DataFrame) -> dict:
+        """Transform a DataFrame into model-ready format.
+
+        Returns
+        -------
+        dict with keys:
+            "numeric": np.ndarray of shape (n_samples, n_numeric)
+                Scaled, imputed numeric features.
+            "categorical": np.ndarray of shape (n_samples, n_categorical)
+                Integer-encoded categorical features (indices into
+                vocabularies). dtype=int64.
+        """
+
+    def transform_target(self, y: np.ndarray) -> np.ndarray:
+        """Transform target variable.
+
+        - Classification: LabelEncoder (string/non-contiguous -> 0..K-1)
+        - Regression: StandardScaler
+        """
+
+    def inverse_transform_target(self, y: np.ndarray) -> np.ndarray:
+        """Inverse-transform target (for regression predictions)."""
+
+    def get_n_categories_per_column(self) -> list[int]:
+        """Return vocabulary size per categorical column.
+
+        Includes +1 for __OOV__ and +1 for __MISSING__ tokens.
+        Used by embedding layers to size their embedding tables.
+        """
+
+    def get_n_numeric_features(self) -> int:
+        """Return number of numeric features after preprocessing."""
+
+    @property
+    def n_classes(self) -> int | None:
+        """Number of classes (classification) or None (regression)."""
+```
+
+**Key implementation details**:
+
+- Numeric imputation: fill NaN with train-fold median per column.
+- Numeric scaling: fit StandardScaler (or RobustScaler) on imputed
+  train data.
+- Categorical encoding: build vocabulary from train fold. Map each
+  value to an integer index. Reserve index 0 for `__OOV__`, index 1
+  for `__MISSING__`. So vocabulary indices start at 2 for real values.
+  If cardinality > max_categorical_cardinality, keep only the top-N
+  most frequent values; map the rest to __OOV__.
+- Missing categoricals: map NaN / None to __MISSING__ index (1).
+- Unseen categoricals (at transform time): map to __OOV__ index (0).
+- Target handling:
+  - Binary/multiclass: fit LabelEncoder on y_train.
+  - Regression: fit StandardScaler on y_train.
+
+**Testing requirements** (`tests/data/test_preprocess.py`):
+
+Generate a synthetic DataFrame with:
+- 3 numeric columns (one with some NaN values)
+- 2 categorical columns (one with NaN, one with a value unseen in
+  train but present in test)
+- Both classification and regression targets
+
+Tests:
+
+- `test_fit_transform_numeric_shape`: assert output["numeric"] has
+  correct shape (n_samples, n_numeric).
+- `test_fit_transform_categorical_shape`: assert output["categorical"]
+  has correct shape and dtype int64.
+- `test_numeric_nan_imputed`: no NaN in output["numeric"].
+- `test_numeric_scaled_zero_mean`: train output has approximately
+  zero mean (tolerance 0.1).
+- `test_categorical_oov_handling`: value not in train vocab maps
+  to index 0.
+- `test_categorical_missing_handling`: NaN categorical maps to
+  index 1.
+- `test_cardinality_cap`: create column with 2000 unique values,
+  set cap to 100. Assert vocabulary size <= 102 (100 + OOV + MISSING).
+- `test_target_transform_classification`: string labels transformed
+  to contiguous integers.
+- `test_target_transform_regression`: transformed target has ~zero
+  mean and ~unit std.
+- `test_inverse_transform_target_regression`: transform then inverse
+  recovers original values (within floating point tolerance).
+- `test_get_n_categories`: returns correct sizes including special
+  tokens.
+- `test_preprocessor_fit_on_train_only`: fit on train, transform
+  test. Scaler params come from train only (verify mean/std differ
+  from test data stats).
+- `test_missing_indicator_toggle`: when add_missing_indicator=True,
+  output["numeric"] has extra columns for each column that had
+  missing values.
+
+---
+---
+
+## PHASE 2: EVALUATION & LOGGING (no model dependencies)
+
+---
+
+### TASK T08: Metrics
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 10.2 (Metrics)
+
+**Objective**: Implement `hybrid_embed/eval/metrics.py` with metric
+computation functions per task type.
+
+**Deliverables**:
+- `hybrid_embed/eval/metrics.py`
+- `tests/eval/test_metrics.py`
+
+**Detailed requirements**:
+
+```
+def compute_metrics(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    y_pred_proba: np.ndarray | None,
+    task: str,
+) -> dict[str, float]:
+    """Compute all relevant metrics for a given task.
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        Ground truth labels/values.
+    y_pred : np.ndarray
+        Predicted labels (classification) or values (regression).
+    y_pred_proba : np.ndarray or None
+        Predicted probabilities. Shape (n,) for binary (probability
+        of positive class) or (n, K) for multiclass. None for
+        regression.
+    task : str
+        "binary", "multiclass", "regression"
+
+    Returns
+    -------
+    dict[str, float]
+        Keys depend on task:
+        - binary: roc_auc, log_loss, pr_auc
+        - multiclass: accuracy, macro_f1, log_loss
+        - regression: rmse, mae, r_squared
+    """
+
+def get_primary_metric_name(task: str) -> str:
+    """Return the primary metric name for a task.
+
+    binary -> "roc_auc"
+    multiclass -> "accuracy"
+    regression -> "rmse"
+    """
+
+def is_higher_better(metric_name: str) -> bool:
+    """Return True if higher values are better for this metric.
+
+    Higher-is-better: roc_auc, pr_auc, accuracy, macro_f1, r_squared
+    Lower-is-better: log_loss, rmse, mae
+    """
+
+def aggregate_fold_metrics(
+    fold_metrics: list[dict[str, float]],
+) -> tuple[dict[str, float], dict[str, float]]:
+    """Compute mean and std across folds.
+
+    Returns (mean_dict, std_dict) with same keys.
+    """
+```
+
+**Testing requirements** (`tests/eval/test_metrics.py`):
+
+- `test_binary_metrics_perfect`: perfect predictions. Assert
+  roc_auc=1.0, log_loss close to 0.
+- `test_binary_metrics_random`: random predictions. Assert roc_auc
+  close to 0.5.
+- `test_multiclass_metrics`: 3-class problem with known predictions.
+  Assert accuracy matches manual calculation.
+- `test_regression_metrics_perfect`: y_pred == y_true. Assert
+  rmse=0, r_squared=1.
+- `test_regression_metrics_known`: hand-calculated example. Assert
+  rmse, mae, r_squared match.
+- `test_primary_metric_names`: assert correct names for each task.
+- `test_is_higher_better`: assert correct for all known metrics.
+- `test_aggregate_fold_metrics`: 3 folds with known metrics. Assert
+  mean and std are correct.
+
+---
+
+### TASK T09: Local Logger
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 11 (Logging)
+
+**Objective**: Implement `hybrid_embed/log/local_logger.py` for
+creating the artifact folder structure and writing all log files.
+
+**Deliverables**:
+- `hybrid_embed/log/local_logger.py`
+- `tests/log/test_local_logger.py`
+
+**Detailed requirements**:
+
+```
+class LocalLogger:
+    """Manages the artifact folder for a single experiment run.
+
+    Creates the folder structure on initialization:
+        <output_dir>/<dataset_id>/run_YYYYMMDD_HHMMSS/
+
+    Parameters
+    ----------
+    output_dir : str
+    dataset_id : str
+    """
+
+    def __init__(self, output_dir: str, dataset_id: str): ...
+
+    @property
+    def run_dir(self) -> str:
+        """Return the full path to this run's directory."""
+
+    def save_config(self, config: dict) -> None:
+        """Save config.yaml to run_dir."""
+
+    def save_schema(self, schema: Schema) -> None:
+        """Save schema.json to run_dir."""
+
+    def save_validation_report(self, report) -> None:
+        """Save validation_report.json to run_dir."""
+
+    def log_embedding_trial(self, trial_record: dict) -> None:
+        """Append a trial record to hpo/embedding_hpo_trials.jsonl."""
+
+    def log_classical_trial(self, trial_record: dict) -> None:
+        """Append a trial record to hpo/classical_hpo_trials.jsonl."""
+
+    def save_best_embedding_config(self, config: dict) -> None:
+        """Save hpo/best_embedding_config.json."""
+
+    def save_best_classical_config(self, config: dict) -> None:
+        """Save hpo/best_classical_config.json."""
+
+    def save_fold_artifacts(
+        self,
+        fold_index: int,
+        metrics: dict,
+        embedding_model=None,      # has .save(path) method
+        classical_model=None,      # saved with joblib
+        predictions: np.ndarray | None = None,
+        embeddings: np.ndarray | None = None,
+    ) -> None:
+        """Save all artifacts for a single fold.
+
+        Creates folds/fold_{fold_index}/ subdirectory.
+        """
+
+    def save_summary_metrics(
+        self,
+        mean_metrics: dict,
+        std_metrics: dict,
+    ) -> None:
+        """Save summary_metrics.json to run_dir."""
+
+    def get_fold_dir(self, fold_index: int) -> str:
+        """Return path to folds/fold_{fold_index}/."""
+
+    def get_hpo_dir(self) -> str:
+        """Return path to hpo/ subdirectory."""
+```
+
+**Testing requirements** (`tests/log/test_local_logger.py`):
+
+Use `tmp_path` (actually, since no fixtures: use `tempfile.mkdtemp()`
+in each test).
+
+- `test_logger_creates_directory_structure`: init logger, assert
+  run_dir exists with hpo/ and correct structure.
+- `test_save_config`: save a dict, read back YAML file, assert match.
+- `test_log_embedding_trial`: log 3 trials, read JSONL, assert 3
+  lines with correct fields.
+- `test_log_classical_trial`: log 2 trials, verify JSONL.
+- `test_save_fold_artifacts_metrics`: save fold 0 metrics, read back,
+  assert match.
+- `test_save_summary_metrics`: save mean/std, read back, assert match.
+- `test_multiple_folds`: save artifacts for folds 0-4, assert all
+  fold directories exist.
+
+---
+---
+
+## PHASE 3: EMBEDDING MODELS
+
+---
+
+### TASK T10: Embedding Model Base Class
+
+**Dependencies**: T01, T03, T02
+**Spec reference**: Section 7 (Embedding Stage), Section 15.1
+(EmbeddingModel ABC)
+
+**Objective**: Implement `hybrid_embed/embed/base.py` with the abstract
+base class for all embedding models.
+
+**Deliverables**:
+- `hybrid_embed/embed/base.py`
+- `tests/embed/test_base.py`
+
+**Detailed requirements**:
+
+```
+from abc import ABC, abstractmethod
+
+class EmbeddingModel(ABC):
+    """Abstract base class for tabular embedding models.
+
+    All embedding models must implement fit, encode, save, and load.
+    The encode method extracts a fixed-length dense vector per sample
+    that will be used as input to classical models.
+
+    Subclasses must set self.embedding_dim after fit().
+    """
+
+    embedding_dim: int  # set after fit()
+
+    @abstractmethod
+    def fit(
+        self,
+        X_train: dict,
+        y_train: np.ndarray,
+        X_val: dict,
+        y_val: np.ndarray,
+        config: dict,
+    ) -> "EmbeddingModel":
+        """Train the embedding model.
+
+        Parameters
+        ----------
+        X_train : dict
+            Keys: "numeric" (np.ndarray, shape (n, n_num)),
+                  "categorical" (np.ndarray, shape (n, n_cat), int64)
+        y_train : np.ndarray
+        X_val : dict (same format)
+        y_val : np.ndarray
+        config : dict
+            Model hyperparameters.
+
+        Returns
+        -------
+        self
+        """
+
+    @abstractmethod
+    def encode(self, X: dict) -> np.ndarray:
+        """Extract embeddings.
+
+        Parameters
+        ----------
+        X : dict (same format as fit)
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples, self.embedding_dim)
+        """
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """Save model state to disk."""
+
+    @classmethod
+    @abstractmethod
+    def load(cls, path: str) -> "EmbeddingModel":
+        """Load model state from disk."""
+
+    def get_training_history(self) -> dict:
+        """Return training history (losses, metrics per epoch).
+
+        Default implementation returns empty dict. Subclasses should
+        override.
+        """
+        return {}
+```
+
+Also implement a helper class for creating PyTorch datasets:
+
+```
+class TabularDataset(torch.utils.data.Dataset):
+    """PyTorch Dataset wrapping preprocessed tabular data.
+
+    Parameters
+    ----------
+    X : dict
+        "numeric" and "categorical" arrays.
+    y : np.ndarray
+    """
+```
+
+**Testing requirements** (`tests/embed/test_base.py`):
+
+- `test_cannot_instantiate_abc`: assert TypeError when trying to
+  instantiate EmbeddingModel directly.
+- `test_concrete_subclass_works`: create a minimal concrete subclass
+  (DummyEmbedding) that returns random vectors. Assert fit/encode
+  work, encode returns correct shape.
+- `test_tabular_dataset_length`: create dataset with 100 samples,
+  assert len is 100.
+- `test_tabular_dataset_getitem`: get item at index 5, assert returns
+  tuple of tensors with correct shapes.
+- `test_tabular_dataset_dtypes`: assert numeric tensor is float32,
+  categorical tensor is long, target tensor is correct dtype.
+
+---
+
+### TASK T11: MLP Embedding Model
+
+**Dependencies**: T10, T02, T07
+**Spec reference**: Section 7.3 Mode A item 1, Section 8.4
+
+**Objective**: Implement `hybrid_embed/embed/scratch_mlp.py` -- a
+tabular MLP with learned categorical embeddings, trained end-to-end.
+
+**Deliverables**:
+- `hybrid_embed/embed/scratch_mlp.py`
+- `tests/embed/test_scratch_mlp.py`
+
+**Detailed requirements**:
+
+Implement two classes: the PyTorch `nn.Module` and the
+`EmbeddingModel` subclass that wraps it.
+
+```
+class TabularMLP(nn.Module):
+    """PyTorch module: MLP with categorical embedding tables.
+
+    Architecture:
+    1. Per-categorical-column embedding table (nn.Embedding)
+    2. Numeric input: optional linear projection to match embedding dim
+    3. Concatenate all embeddings + numeric projection
+    4. MLP trunk: sequence of [Linear -> Norm? -> Activation -> Dropout]
+    5. Output head: Linear -> output (for training loss)
+    6. Embedding extraction point: output of last hidden layer
+       (penultimate layer, before the output head)
+
+    Parameters
+    ----------
+    n_numeric : int
+    n_categories_per_column : list[int]
+        Vocabulary size per categorical column.
+    embedding_dim : int
+        Dimension for each categorical embedding.
+    hidden_dims : list[int]
+        Width of each hidden layer.
+    dropout : float
+    activation : str
+        "relu", "gelu", or "silu"
+    use_layer_norm : bool
+    task : str
+        "binary", "multiclass", "regression"
+    n_classes : int or None
+        Number of classes (for classification output head).
+    """
+
+    def forward(self, x_numeric, x_categorical):
+        """Full forward pass (for training). Returns task output."""
+
+    def encode(self, x_numeric, x_categorical):
+        """Forward pass up to penultimate layer. Returns embedding."""
+
+
+class MLPEmbeddingModel(EmbeddingModel):
+    """EmbeddingModel wrapper around TabularMLP.
+
+    Handles training loop, early stopping, device management,
+    and implements the full EmbeddingModel interface.
+
+    Config keys (from Hyperopt search space):
+        embedding_dim: int (32-256)
+        hidden_dims: list[int] (derived from depth + width)
+        dropout: float (0-0.5)
+        activation: str
+        use_layer_norm: bool
+        lr: float
+        weight_decay: float
+        batch_size: int
+        max_epochs: int
+        patience: int
+        device: str
+    """
+
+    def fit(self, X_train, y_train, X_val, y_val, config):
+        """Train the MLP.
+
+        Training loop:
+        1. Build model from config
+        2. Create DataLoaders
+        3. Train with AdamW optimizer
+        4. Early stopping on validation loss
+        5. Restore best weights
+
+        The validation metric used for early stopping is the task
+        loss (not the downstream proxy metric -- that is handled
+        by the HPO layer).
+        """
+
+    def encode(self, X):
+        """Extract embeddings using the trained model.
+
+        Sets model to eval mode, disables gradients, runs encode()
+        in batches, concatenates, returns CPU numpy array.
+        """
+
+    def save(self, path): ...
+    def load(cls, path): ...
+```
+
+**Key implementation details**:
+
+- Loss function: BCEWithLogitsLoss (binary), CrossEntropyLoss
+  (multiclass), MSELoss (regression).
+- Early stopping: track validation loss. If no improvement for
+  `patience` epochs, stop and restore best weights.
+- Encoding: use `model.encode()` (penultimate layer output) in
+  eval mode with `torch.no_grad()`.
+- Batch encoding: process in batches to avoid OOM on large datasets.
+  Default encoding batch size: 4096.
+- Device: move model and data to config["device"].
+
+**Testing requirements** (`tests/embed/test_scratch_mlp.py`):
+
+Generate synthetic data:
+- 200 samples, 5 numeric features, 3 categorical features
+- Categorical vocab sizes: [10, 5, 8]
+- Binary classification target
+
+Tests:
+
+- `test_tabular_mlp_forward_shape`: create TabularMLP, forward pass,
+  assert output shape (batch_size, n_classes or 1).
+- `test_tabular_mlp_encode_shape`: call .encode(), assert shape is
+  (batch_size, last_hidden_dim).
+- `test_mlp_embedding_model_fit`: fit MLPEmbeddingModel with small
+  config (2 layers, 64 width, 3 epochs). Assert no errors.
+  Assert self.embedding_dim is set.
+- `test_mlp_embedding_model_encode`: after fit, encode train data.
+  Assert output shape (n_samples, embedding_dim).
+  Assert output is numpy array. Assert no NaN values.
+- `test_mlp_embedding_model_encode_deterministic`: encode same data
+  twice, assert identical results.
+- `test_mlp_save_load_roundtrip`: fit, save, load, encode. Assert
+  same embeddings before and after save/load (within tolerance).
+- `test_mlp_early_stopping`: fit with patience=2, max_epochs=100,
+  on trivial data. Assert training stopped before 100 epochs (check
+  training history).
+- `test_mlp_different_activations`: test with "relu", "gelu", "silu".
+  Assert all produce valid outputs.
+- `test_mlp_regression_task`: fit on regression task (continuous y).
+  Assert no errors and valid embeddings.
+
+---
+
+### TASK T12: FT-Transformer Embedding Model
+
+**Dependencies**: T10, T02, T07
+**Spec reference**: Section 7.3 Mode A item 2, Section 8.5
+
+**Objective**: Implement `hybrid_embed/embed/scratch_fttransformer.py`
+-- an FT-Transformer model for tabular data.
+
+**Deliverables**:
+- `hybrid_embed/embed/scratch_fttransformer.py`
+- `tests/embed/test_scratch_fttransformer.py`
+
+**Detailed requirements**:
+
+```
+class FTTransformer(nn.Module):
+    """Feature Tokenizer + Transformer for tabular data.
+
+    Architecture:
+    1. Feature tokenization:
+       - Numeric features: each feature -> linear projection to d_model
+         (learned scalar-to-vector mapping per feature)
+       - Categorical features: each feature -> nn.Embedding of d_model
+    2. Prepend a learnable [CLS] token
+    3. Transformer encoder (n_layers of MultiHeadAttention + FFN)
+    4. Output: [CLS] token representation = embedding
+    5. Task head: Linear(d_model, output_dim) on top of [CLS]
+
+    Parameters
+    ----------
+    n_numeric : int
+    n_categories_per_column : list[int]
+    d_model : int
+    n_heads : int
+    n_layers : int
+    attn_dropout : float
+    ff_dropout : float
+    task : str
+    n_classes : int or None
+    """
+
+    def forward(self, x_numeric, x_categorical):
+        """Full forward pass for training."""
+
+    def encode(self, x_numeric, x_categorical):
+        """Return [CLS] token embedding."""
+
+
+class FTTransformerEmbeddingModel(EmbeddingModel):
+    """EmbeddingModel wrapper around FTTransformer.
+
+    Same training loop pattern as MLPEmbeddingModel: AdamW, early
+    stopping, batch encoding. The embedding_dim equals d_model.
+
+    Config keys:
+        d_model: int (64-512)
+        n_heads: int (4-16)
+        n_layers: int (2-6)
+        attn_dropout: float (0-0.3)
+        ff_dropout: float (0-0.5)
+        lr: float
+        weight_decay: float
+        batch_size: int
+        max_epochs: int
+        patience: int
+        device: str
+    """
+```
+
+**Key implementation details**:
+
+- Feature tokenization: each numeric feature gets its own
+  `nn.Linear(1, d_model)`. Each categorical feature gets its own
+  `nn.Embedding(n_categories, d_model)`.
+- CLS token: a learnable `nn.Parameter(1, d_model)`, prepended to
+  the token sequence.
+- Transformer: use `nn.TransformerEncoderLayer` and
+  `nn.TransformerEncoder` from PyTorch. Set `batch_first=True`.
+- FFN dimension: 4 * d_model (standard transformer ratio).
+- The embedding is the CLS token output from the last transformer
+  layer.
+- Constraint: d_model must be divisible by n_heads. The HPO space
+  must enforce this.
+
+**Testing requirements** (`tests/embed/test_scratch_fttransformer.py`):
+
+Same synthetic data as MLP tests.
+
+- `test_fttransformer_forward_shape`: forward pass, assert output
+  shape.
+- `test_fttransformer_encode_shape`: .encode() returns
+  (batch_size, d_model).
+- `test_fttransformer_model_fit`: fit with small config (2 layers,
+  64 d_model, 3 epochs). No errors.
+- `test_fttransformer_model_encode`: after fit, encode returns
+  correct shape numpy array with no NaN.
+- `test_fttransformer_model_encode_deterministic`: same input -> same
+  output.
+- `test_fttransformer_save_load_roundtrip`: save, load, same
+  embeddings.
+- `test_fttransformer_numeric_only`: dataset with no categoricals.
+  Assert works.
+- `test_fttransformer_categorical_only`: dataset with no numerics.
+  Assert works.
+- `test_fttransformer_regression`: regression task. Assert valid
+  output.
+
+---
+---
+
+## PHASE 4: CLASSICAL MODELS
+
+---
+
+### TASK T13: Classical Model Zoo
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 9.2 (Allowed model families), Section 9.3
+(Classical model tuning)
+
+**Objective**: Implement `hybrid_embed/classical/model_zoo.py` with
+a registry of all classical models and their default Hyperopt search
+spaces.
+
+**Deliverables**:
+- `hybrid_embed/classical/model_zoo.py`
+- `tests/classical/test_model_zoo.py`
+
+**Detailed requirements**:
+
+```
+CLASSIFICATION_MODELS = {
+    "logistic_regression": {
+        "class": sklearn.linear_model.LogisticRegression,
+        "default_params": {"max_iter": 1000},
+        "search_space": { ... },  # Hyperopt space
+    },
+    "random_forest": { ... },
+    "extra_trees": { ... },
+    "xgboost": { ... },
+    "lightgbm": { ... },
+    "catboost": { ... },
+}
+
+REGRESSION_MODELS = {
+    "ridge": { ... },
+    "elastic_net": { ... },
+    "random_forest": { ... },
+    "extra_trees": { ... },
+    "xgboost": { ... },
+    "lightgbm": { ... },
+    "catboost": { ... },
+}
+
+def get_model_registry(task: str) -> dict:
+    """Return the appropriate model registry for the task.
+
+    Parameters
+    ----------
+    task : str
+        "binary", "multiclass", or "regression".
+
+    Returns
+    -------
+    dict
+        Model name -> model spec dict.
+    """
+
+def build_model(
+    model_name: str,
+    params: dict,
+    task: str,
+    random_state: int = 42,
+) -> object:
+    """Instantiate a classical model with given parameters.
+
+    Handles task-specific configuration:
+    - XGBoost: set objective based on task, eval_metric, etc.
+    - LightGBM: set objective, verbose=-1
+    - CatBoost: set verbose=0, loss_function based on task
+
+    Returns sklearn-compatible model with fit/predict/predict_proba.
+    """
+
+def train_classical_model(
+    model,
+    E_train: np.ndarray,
+    y_train: np.ndarray,
+    E_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    task: str = "binary",
+) -> object:
+    """Train a classical model, with early stopping for boosted models.
+
+    For XGBoost/LightGBM/CatBoost: use eval_set=(E_val, y_val) and
+    early_stopping_rounds=50 if val data is provided.
+
+    For sklearn models: just call model.fit(E_train, y_train).
+
+    Returns the trained model.
+    """
+```
+
+**Search spaces to define** (using hyperopt hp functions):
+
+- LogisticRegression: C (log-uniform)
+- Ridge: alpha (log-uniform)
+- ElasticNet: alpha (log-uniform), l1_ratio (uniform 0-1)
+- RandomForest: n_estimators, max_depth, min_samples_leaf,
+  max_features
+- ExtraTrees: same as RandomForest
+- XGBoost: n_estimators, max_depth, learning_rate, subsample,
+  colsample_bytree, min_child_weight, gamma, reg_alpha, reg_lambda
+- LightGBM: n_estimators, max_depth, learning_rate, subsample,
+  colsample_bytree, min_child_samples, reg_alpha, reg_lambda,
+  num_leaves
+- CatBoost: iterations, depth, learning_rate, l2_leaf_reg
+
+**Testing requirements** (`tests/classical/test_model_zoo.py`):
+
+Generate synthetic embedding data:
+- 200 samples, 64 features (simulating embeddings)
+- Binary target, multiclass target (5 classes), regression target
+
+Tests:
+
+- `test_get_model_registry_classification`: assert all expected model
+  names are present.
+- `test_get_model_registry_regression`: assert all expected model
+  names are present.
+- `test_build_model_each_classifier`: loop through all classification
+  models, build each, assert has fit and predict_proba methods.
+- `test_build_model_each_regressor`: loop through all regression
+  models, build each, assert has fit and predict methods.
+- `test_train_logistic_regression`: build + train + predict on
+  synthetic data. Assert predictions have correct shape.
+- `test_train_xgboost_with_early_stopping`: train with val set,
+  assert model converges.
+- `test_train_lightgbm_with_early_stopping`: same.
+- `test_train_catboost_with_early_stopping`: same.
+- `test_train_random_forest`: train without val set. Assert
+  predictions correct shape.
+
+---
+---
+
+## PHASE 5: HYPERPARAMETER OPTIMIZATION
+
+---
+
+### TASK T14: HPO Search Spaces
+
+**Dependencies**: T01, T03
+**Spec reference**: Section 8.4 (MLP space), Section 8.5
+(FT-Transformer space), Section 9.3 (Classical space)
+
+**Objective**: Implement `hybrid_embed/hpo/spaces.py` with all
+Hyperopt search space definitions.
+
+**Deliverables**:
+- `hybrid_embed/hpo/spaces.py`
+- `tests/hpo/test_spaces.py`
+
+**Detailed requirements**:
+
+```
+from hyperopt import hp
+
+def get_mlp_search_space() -> dict:
+    """Return Hyperopt search space for MLP embedding model.
+
+    Keys:
+        embedding_dim: hp.quniform(32, 256, 16)  -> cast to int
+        depth: hp.quniform(2, 8, 1) -> cast to int
+        width: hp.quniform(128, 2048, 64) -> cast to int
+        dropout: hp.uniform(0, 0.5)
+        activation: hp.choice(["relu", "gelu", "silu"])
+        use_layer_norm: hp.choice([True, False])
+        lr: hp.loguniform(ln(1e-5), ln(1e-2))
+        weight_decay: hp.loguniform(ln(1e-6), ln(1e-2))
+        batch_size: hp.choice([256, 512, 1024, 2048])
+    """
+
+def get_fttransformer_search_space() -> dict:
+    """Return Hyperopt search space for FT-Transformer.
+
+    Keys:
+        d_model: hp.choice([64, 128, 192, 256, 384, 512])
+        n_heads: hp.choice([4, 8, 16])
+        -- constraint: d_model % n_heads == 0 enforced in
+           objective function (invalid combos penalized)
+        n_layers: hp.quniform(2, 6, 1) -> cast to int
+        attn_dropout: hp.uniform(0, 0.3)
+        ff_dropout: hp.uniform(0, 0.5)
+        lr: hp.loguniform(ln(1e-5), ln(1e-3))
+        weight_decay: hp.loguniform(ln(1e-6), ln(1e-2))
+        batch_size: hp.choice([128, 256, 512])
+    """
+
+def get_classical_search_space(task: str) -> dict:
+    """Return Hyperopt search space for classical model selection.
+
+    Uses hp.choice at the top level to select model family,
+    then each branch has its own param space.
+
+    task determines whether classification or regression models
+    are included.
+    """
+
+def sample_from_space(space: dict) -> dict:
+    """Sample one configuration from a Hyperopt space.
+
+    Utility for testing -- uses hyperopt.pyll.stochastic.sample.
+    """
+
+def postprocess_mlp_params(params: dict) -> dict:
+    """Convert Hyperopt sample to clean config dict.
+
+    - Cast quniform values to int
+    - Derive hidden_dims list from depth and width
+    - Resolve hp.choice indices to actual values
+    """
+
+def postprocess_fttransformer_params(params: dict) -> dict:
+    """Convert Hyperopt sample to clean config dict.
+
+    - Cast values to correct types
+    - Validate d_model % n_heads == 0
+    """
+
+def postprocess_classical_params(params: dict) -> tuple[str, dict]:
+    """Convert Hyperopt sample to (model_name, clean_params).
+
+    Returns the model name and its cleaned hyperparameters.
+    """
+```
+
+**Testing requirements** (`tests/hpo/test_spaces.py`):
+
+- `test_mlp_space_sample`: sample 10 configs, assert all have
+  required keys with values in valid ranges.
+- `test_fttransformer_space_sample`: sample 10 configs, assert
+  required keys and valid ranges.
+- `test_classical_space_sample_classification`: sample 10, assert
+  each has a model_name key.
+- `test_classical_space_sample_regression`: sample 10, assert each
+  has a model_name key.
+- `test_postprocess_mlp_params`: sample, postprocess, assert
+  hidden_dims is a list[int] of correct length.
+- `test_postprocess_fttransformer_valid`: sample with valid d_model/
+  n_heads combo. Assert no error.
+- `test_postprocess_classical_params`: sample, postprocess, assert
+  returns (str, dict).
+
+---
+
+### TASK T15: Embedding HPO Search
+
+**Dependencies**: T10, T11, T12, T14, T08, T09, T13
+**Spec reference**: Section 8.1-8.3
+
+**Objective**: Implement `hybrid_embed/hpo/embed_search.py` -- the
+Hyperopt search loop for finding the best embedding model configuration.
+
+**Deliverables**:
+- `hybrid_embed/hpo/embed_search.py`
+- `tests/hpo/test_embed_search.py`
+
+**Detailed requirements**:
+
+```
+def hyperopt_search_embedding(
+    X_train: dict,
+    y_train: np.ndarray,
+    X_val: dict,
+    y_val: np.ndarray,
+    task: str,
+    n_numeric: int,
+    n_categories_per_column: list[int],
+    n_classes: int | None,
+    embedding_model_type: str,  # "mlp" or "fttransformer"
+    proxy_model: str = "linear",
+    max_trials: int = 50,
+    max_epochs: int = 50,
+    patience: int = 8,
+    time_budget_seconds: float | None = None,
+    master_seed: int = 42,
+    device: str = "cpu",
+    logger: LocalLogger | None = None,
+) -> dict:
+    """Run Hyperopt TPE search for embedding model hyperparameters.
+
+    Per trial:
+    1. Sample hyperparameters from the appropriate search space.
+    2. Postprocess params.
+    3. Build and train embedding model (with early stopping).
+    4. Extract embeddings for train and val.
+    5. Train proxy model on embeddings.
+    6. Score proxy model on val embeddings.
+    7. Log trial to logger (if provided).
+    8. Return negative score for Hyperopt.
+
+    If time_budget_seconds is set, stop launching new trials once
+    the wall-clock budget is exceeded.
+
+    Parameters
+    ----------
+    ... (as above)
+
+    Returns
+    -------
+    dict with keys:
+        "best_params": dict (postprocessed best configuration)
+        "best_score": float (best validation metric value)
+        "n_trials_completed": int
+        "total_time_seconds": float
+    """
+```
+
+**Proxy model logic**:
+
+```
+def _build_proxy_model(task: str, proxy_type: str):
+    """Build the proxy model used to evaluate embedding quality.
+
+    proxy_type "linear":
+        classification -> LogisticRegression(max_iter=1000)
+        regression -> Ridge()
+
+    proxy_type "lightgbm":
+        classification -> LGBMClassifier(n_estimators=100, verbose=-1)
+        regression -> LGBMRegressor(n_estimators=100, verbose=-1)
+    """
+
+def _evaluate_embeddings(
+    E_train, y_train, E_val, y_val, task, proxy_type
+) -> float:
+    """Train proxy model on embeddings, return validation score.
+
+    Uses the primary metric for the task (roc_auc, accuracy, rmse).
+    For regression (where lower is better), negate so that higher
+    is always better (Hyperopt minimizes, so we negate again in
+    the objective).
+    """
+```
+
+**Testing requirements** (`tests/hpo/test_embed_search.py`):
+
+Generate small synthetic preprocessed data (100 train, 30 val,
+3 numeric, 2 categorical with small vocabs).
+
+- `test_embedding_search_runs`: run search with max_trials=3,
+  max_epochs=3. Assert returns dict with required keys.
+  Assert n_trials_completed == 3.
+- `test_embedding_search_returns_valid_config`: assert best_params
+  has all required keys for the model type.
+- `test_embedding_search_time_budget`: set time_budget=5 seconds,
+  max_trials=1000. Assert finishes in reasonable time and
+  n_trials < 1000.
+- `test_embedding_search_logs_trials`: provide a logger, run 3
+  trials. Assert 3 lines in the JSONL file.
+- `test_proxy_model_linear_classification`: train proxy on random
+  embeddings, assert returns a float score.
+- `test_proxy_model_linear_regression`: same for regression.
+
+Note: these tests use small data and few trials to run fast.
+They verify the machinery works, not the quality of the search.
+
+---
+
+### TASK T16: Classical HPO Search
+
+**Dependencies**: T13, T14, T08, T09
+**Spec reference**: Section 9.3
+
+**Objective**: Implement `hybrid_embed/hpo/classical_search.py` --
+the Hyperopt search for finding the best classical model and its
+hyperparameters.
+
+**Deliverables**:
+- `hybrid_embed/hpo/classical_search.py`
+- `tests/hpo/test_classical_search.py`
+
+**Detailed requirements**:
+
+```
+def hyperopt_search_classical(
+    E_train: np.ndarray,
+    y_train: np.ndarray,
+    E_val: np.ndarray,
+    y_val: np.ndarray,
+    task: str,
+    max_trials: int = 150,
+    time_budget_seconds: float | None = None,
+    master_seed: int = 42,
+    logger: LocalLogger | None = None,
+) -> dict:
+    """Run Hyperopt TPE search for classical model selection + tuning.
+
+    Per trial:
+    1. Sample (model_type, hyperparams) from classical search space.
+    2. Postprocess params.
+    3. Build model.
+    4. Train model (with early stopping for boosted models if val
+       data provided).
+    5. Compute validation metric.
+    6. Log trial.
+    7. Return negative score.
+
+    Returns
+    -------
+    dict with keys:
+        "best_model_name": str
+        "best_params": dict
+        "best_score": float
+        "n_trials_completed": int
+        "total_time_seconds": float
+    """
+```
+
+**Testing requirements** (`tests/hpo/test_classical_search.py`):
+
+Generate synthetic embedding data (200 train, 50 val, 64 features).
+
+- `test_classical_search_binary`: run with max_trials=5, binary task.
+  Assert returns dict with required keys.
+- `test_classical_search_multiclass`: max_trials=5, multiclass.
+  Assert valid output.
+- `test_classical_search_regression`: max_trials=5, regression.
+  Assert valid output.
+- `test_classical_search_logs_trials`: provide logger, assert JSONL
+  has correct number of lines.
+- `test_classical_search_time_budget`: set short time budget, many
+  trials. Assert exits within budget.
+- `test_classical_search_best_model_is_buildable`: take best_model_name
+  and best_params, build_model with them, assert succeeds.
+
+---
+---
+
+## PHASE 6: ORCHESTRATION & CLI
+
+---
+
+### TASK T17: Experiment Runner
+
+**Dependencies**: T04, T05, T06, T07, T08, T09, T10, T11, T12,
+T13, T15, T16
+**Spec reference**: Section 2.1 (Pipeline stages), Section 8.1
+(CV + HPO), Section 9.1 (Per-fold evaluation), Section 15.3
+
+**Objective**: Implement `hybrid_embed/eval/runner.py` -- the main
+experiment orchestrator that ties all stages together.
+
+**Deliverables**:
+- `hybrid_embed/eval/runner.py`
+- `tests/eval/test_runner.py`
+
+**Detailed requirements**:
+
+```
+def run_experiment(
+    X: pd.DataFrame,
+    y: pd.Series | np.ndarray,
+    task_config: TaskConfig,
+    budget_config: BudgetConfig,
+    run_config: RunConfig,
+) -> RunResult:
+    """Run full experiment pipeline.
+
+    Steps:
+    1. seed_everything(run_config.master_seed)
+    2. Validate data -> X_clean, validation_report
+    3. Infer schema
+    4. Generate CV splits
+    5. HPO phase (on fold 0):
+       a. Fit preprocessor on fold-0 train
+       b. Transform fold-0 train/val
+       c. Transform target
+       d. For each embedding_model_type in run_config:
+          - Run embedding HPO search
+          - Keep the best across all model types
+       e. Using best embedding config:
+          - Train embedding model on fold-0 train
+          - Extract fold-0 train/val embeddings
+          - Run classical HPO search on embeddings
+    6. Per-fold evaluation:
+       For each fold:
+       a. Fit fresh preprocessor on this fold's train
+       b. Transform train, val, test
+       c. Train embedding model with best config (early stop on val)
+       d. Extract embeddings for train, val, test
+       e. Train classical model with best config on train embeddings
+          (with val for early stopping if applicable)
+       f. Predict on test embeddings
+       g. Compute metrics
+       h. Save fold artifacts
+    7. Aggregate metrics across folds
+    8. Save summary and return RunResult
+
+    Parameters
+    ----------
+    X : pd.DataFrame
+    y : pd.Series or np.ndarray
+    task_config : TaskConfig
+    budget_config : BudgetConfig
+    run_config : RunConfig
+
+    Returns
+    -------
+    RunResult
+    """
+```
+
+Also implement the sklearn-style wrapper:
+
+```
+class HybridTabularModel:
+    """Sklearn-style interface for the hybrid embedding framework.
+
+    Parameters
+    ----------
+    task : str
+    budget_config : BudgetConfig, optional
+    run_config : RunConfig, optional
+    """
+
+    def __init__(self, task, budget_config=None, run_config=None): ...
+
+    def fit(self, X, y):
+        """Run HPO + train best models.
+
+        For prediction purposes, trains a single embedding model
+        and a single classical model using the best configs found
+        during HPO. Uses a single train/val split (not full CV).
+        """
+
+    def predict(self, X):
+        """Predict using fitted models."""
+
+    def predict_proba(self, X):
+        """Predict probabilities (classification only)."""
+```
+
+**Testing requirements** (`tests/eval/test_runner.py`):
+
+Generate a small synthetic dataset: 150 rows, 4 numeric columns,
+2 categorical columns, binary target.
+
+Use minimal budget: 2 embedding trials, 3 epochs each, 5 classical
+trials, 2-fold CV.
+
+- `test_run_experiment_completes`: run full experiment on synthetic
+  data. Assert returns RunResult with correct n_folds.
+- `test_run_experiment_metrics_populated`: assert mean_metrics and
+  std_metrics have expected keys for binary classification.
+- `test_run_experiment_fold_results`: assert fold_results has correct
+  length, each FoldResult has metrics.
+- `test_run_experiment_artifacts_created`: check that the run
+  directory was created with expected subdirectories and files.
+- `test_hybrid_tabular_model_fit_predict`: create HybridTabularModel,
+  fit on synthetic data, predict on same data. Assert predictions
+  have correct shape.
+- `test_hybrid_tabular_model_predict_proba`: for classification,
+  assert predict_proba returns correct shape.
+
+Note: these are "smoke tests" -- they verify the pipeline runs
+end-to-end on small data, not that the models are accurate.
+
+---
+
+### TASK T18: CLI Entry Point
+
+**Dependencies**: T17
+**Spec reference**: Section 14 (cli/run_benchmark.py)
+
+**Objective**: Implement `hybrid_embed/cli/run_benchmark.py` -- a
+command-line interface for running experiments.
+
+**Deliverables**:
+- `hybrid_embed/cli/run_benchmark.py`
+- `tests/cli/test_run_benchmark.py` (light tests)
+
+**Detailed requirements**:
+
+Use Python `argparse`. The CLI should support:
+
+```
+python -m hybrid_embed.cli.run_benchmark \
+    --dataset adult \
+    --task binary \
+    --n-folds 5 \
+    --embed-trials 50 \
+    --classical-trials 150 \
+    --device auto \
+    --seed 42 \
+    --output-dir runs
+```
+
+Arguments:
+
+```
+--dataset: str (required)
+    One of: "adult", "california_housing", or a path to a CSV file.
+    Built-in datasets fetched via sklearn.datasets or openml.
+--task: str (required)
+    "binary", "multiclass", "regression"
+--target-column: str (optional)
+    Column name for target. If using built-in datasets, inferred
+    automatically.
+--n-folds: int (default 5)
+--embed-models: str (default "mlp")
+    Comma-separated: "mlp", "fttransformer", "mlp,fttransformer"
+--embed-trials: int (default 50)
+--embed-max-epochs: int (default 50)
+--classical-trials: int (default 150)
+--device: str (default "auto")
+--seed: int (default 42)
+--output-dir: str (default "runs")
+--save-embeddings: flag (default False)
+```
+
+Implement dataset loading:
+
+```
+def load_dataset(name: str, target_column: str | None = None):
+    """Load a dataset by name or path.
+
+    Built-in:
+    - "adult": fetch from OpenML (id=1590) or sklearn
+    - "california_housing": sklearn.datasets.fetch_california_housing
+    - "covertype": sklearn.datasets.fetch_covtype
+
+    Custom:
+    - If name ends with ".csv", load from path. target_column
+      is required in this case.
+
+    Returns (X: DataFrame, y: ndarray, inferred_task: str)
+    """
+```
+
+**Testing requirements** (`tests/cli/test_run_benchmark.py`):
+
+- `test_load_dataset_california`: load california_housing, assert
+  X is DataFrame and y is ndarray with correct lengths.
+- `test_load_dataset_csv`: create a tmp CSV, load it, assert correct.
+- `test_parse_args_defaults`: parse minimal args, assert defaults
+  are correct.
+- `test_parse_args_custom`: parse with all args specified, assert
+  values.
+
+Note: do NOT test the full CLI end-to-end here (that's the
+integration test). Just test the helpers and argument parsing.
+
+---
+---
+
+## PHASE 7: INTEGRATION & VALIDATION
+
+---
+
+### TASK T19: End-to-End Integration Tests
+
+**Dependencies**: T17, T18
+**Spec reference**: Section 17 (Acceptance Criteria)
+
+**Objective**: Write integration tests that run the full pipeline
+on real (small) datasets, verifying the acceptance criteria.
+
+**Deliverables**:
+- `tests/test_integration.py`
+
+**Detailed requirements**:
+
+These tests run the full pipeline end-to-end. They are expected
+to be slow (minutes, not seconds). Mark them with
+`@pytest.mark.slow` so they can be skipped in CI with
+`pytest -m "not slow"`.
+
+```
+import pytest
+
+@pytest.mark.slow
+def test_end_to_end_binary_classification():
+    """Full pipeline on a binary classification dataset.
+
+    Uses a small subset of Adult or a synthetic binary dataset.
+    Budget: 3 embed trials, 5 epochs, 5 classical trials, 2 folds.
+
+    Asserts:
+    - RunResult is returned
+    - mean_metrics has roc_auc key
+    - roc_auc > 0.5 (better than random)
+    - Artifact folder exists with expected structure
+    - Embedding HPO JSONL has 3 lines
+    - Classical HPO JSONL has 5 lines
+    - 2 fold subdirectories exist
+    - summary_metrics.json exists and is valid JSON
+    """
+
+@pytest.mark.slow
+def test_end_to_end_multiclass_classification():
+    """Full pipeline on a multiclass dataset.
+
+    Uses synthetic data with 4 classes.
+    Same minimal budget as above.
+
+    Asserts:
+    - mean_metrics has accuracy key
+    - accuracy > 0.25 (better than random for 4 classes)
+    """
+
+@pytest.mark.slow
+def test_end_to_end_regression():
+    """Full pipeline on a regression dataset.
+
+    Uses California Housing (small subset) or synthetic.
+    Same minimal budget.
+
+    Asserts:
+    - mean_metrics has rmse key
+    - r_squared > 0 (better than predicting mean)
+    """
+
+@pytest.mark.slow
+def test_end_to_end_fttransformer():
+    """Full pipeline using FT-Transformer as embedding model.
+
+    Same as binary test but with embedding_models=["fttransformer"].
+    Budget: 2 embed trials, 3 epochs, 3 classical trials, 2 folds.
+
+    Asserts:
+    - Pipeline completes without error
+    - Valid RunResult returned
+    """
+
+@pytest.mark.slow
+def test_reproducibility():
+    """Run the same experiment twice with the same seed.
+
+    Assert that fold metrics are identical (or very close) across
+    both runs.
+    """
+
+def test_embeddings_only_constraint():
+    """Verify that classical models never see raw features.
+
+    This is a structural test, not a full pipeline run.
+    - Inspect the runner code to verify that classical models
+      receive only embeddings (np.ndarray from encode()).
+    - Alternatively: run with small data, check that embedding
+      shape matches classical model input shape.
+    """
+```
+
+---
+---
+
+## TASK SUMMARY TABLE
+
+| ID  | Title                          | Phase | Depends on              | Estimated effort |
+|-----|--------------------------------|-------|-------------------------|------------------|
+| T01 | Project scaffolding            | 0     | --                      | Small            |
+| T02 | Utility functions              | 0     | T01                     | Small            |
+| T03 | Configuration dataclasses      | 0     | T01                     | Small            |
+| T04 | Data validation                | 1     | T01, T03                | Small            |
+| T05 | Schema inference               | 1     | T01, T03                | Small            |
+| T06 | Split generation               | 1     | T01, T03                | Small            |
+| T07 | Preprocessing                  | 1     | T01, T03, T05           | Medium           |
+| T08 | Metrics                        | 2     | T01, T03                | Small            |
+| T09 | Local logger                   | 2     | T01, T03                | Small            |
+| T10 | Embedding base class           | 3     | T01, T03, T02           | Small            |
+| T11 | MLP embedding model            | 3     | T10, T02, T07           | Large            |
+| T12 | FT-Transformer model           | 3     | T10, T02, T07           | Large            |
+| T13 | Classical model zoo            | 4     | T01, T03                | Medium           |
+| T14 | HPO search spaces              | 5     | T01, T03                | Small            |
+| T15 | Embedding HPO search           | 5     | T10-T12, T14, T08, T09 | Medium           |
+| T16 | Classical HPO search           | 5     | T13, T14, T08, T09     | Medium           |
+| T17 | Experiment runner              | 6     | T04-T16                 | Large            |
+| T18 | CLI entry point                | 6     | T17                     | Small            |
+| T19 | Integration tests              | 7     | T17, T18                | Medium           |
+
+## PARALLELIZATION GUIDE
+
+Tasks that can be developed in parallel (no dependencies between them):
+
+- **Parallel group A** (after T01): T02, T03
+- **Parallel group B** (after T03): T04, T05, T06, T08, T09, T13, T14
+- **Parallel group C** (after T10 + T07): T11, T12
+- **Parallel group D** (after models + spaces): T15, T16
+- **Sequential tail**: T17 -> T18 -> T19
+
+---
+
+## PROMPTING TEMPLATE FOR AGENTS
+
+When assigning a task to an agent, use this template:
+
+```
+You are implementing task {TASK_ID}: {TASK_TITLE} for the hybrid_embed
+project.
+
+CONTEXT:
+Read the full technical specification at:
+  documentation/tech_task_improved.txt
+Focus on sections: {RELEVANT_SECTIONS}
+
+DEPENDENCIES (already implemented):
+{LIST OF COMPLETED TASKS AND THEIR KEY FILES}
+
+YOUR DELIVERABLES:
+{LIST OF FILES TO CREATE}
+
+DETAILED REQUIREMENTS:
+{COPY THE REQUIREMENTS FROM THIS TASK}
+
+CONSTRAINTS:
+- numpy-style docstrings on all public functions/classes
+- Unit tests following project guidelines (no fixtures, no mocks,
+  explicit data generation, print statements, assert statements)
+- No emojis in code
+- Run pytest on your tests after implementing
+
+WHEN DONE:
+- List all files you created/modified
+- Show pytest output
+- Confirm all tests pass
+```
