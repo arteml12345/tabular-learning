@@ -1,0 +1,20 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# No Emojis in Code - Global Rule
+
+## Prohibition
+
+**NEVER** use emojis in any code files, including but not limited to:
+- Variable names
+- Function names
+- Class names
+- Comments
+- Docstrings
+- String literals (unless specifically required for the application's functionality)
+- Error messages
+- Log messages
+- Test names or test output
+- print statements

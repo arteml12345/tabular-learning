@@ -1,0 +1,93 @@
+---
+description: 
+globs: 
+alwaysApply: false
+---
+# Unit Testing Guidelines
+
+## Framework and Core Principles
+
+This project uses **pytest** as the testing framework. All unit tests must follow these strict guidelines to ensure consistency, clarity, and maintainability.
+
+## Forbidden Practices
+
+### 1. No Fixtures
+- **NEVER** use pytest fixtures
+- Fixtures are strictly forbidden in this codebase
+- All test data must be generated explicitly within each test function
+
+### 2. No Mock Functionality
+- **NEVER** use mock objects, patch decorators, or any mocking functionality
+- Exception: Only use mocking when explicitly requested
+- Tests should work with real objects, real function calls, and real (or random generated) data
+
+## Data Generation Requirements
+
+### 3. Explicit Random Data Generation
+- When a tested function needs data to work with, generate random data **explicitly** in the unit test module
+- Use libraries like `random`, `numpy`, `pandas` to create test data
+- Make data generation visible and understandable within the test
+- Fix random seeds for reproducibility
+
+## Demo-Purpose Testing
+
+### 4. Educational Unit Tests
+Unit tests serve dual purposes:
+- **Testing functionality**: Verify that functions work correctly
+- **Demo/Documentation**: Serve as live examples of how functions work
+
+Tests should be structured so that anyone can:
+1. Open an ipython console
+2. Run test code piece by piece (imports + helper functions + test body)
+3. Understand function inputs, outputs, and behavior
+
+## Debugging and Visibility
+
+### 5. Use Print Statements for Visibility
+- Include `print()` statements in unit tests to show:
+  - What the test is doing
+  - Preliminary results
+  - Intermediate values
+- Prints help with debugging and understanding test flow
+- **Important**: Prints are logs for visibility, NOT substitutes for `assert` statements
+- All tests must still use proper `assert` statements for validation
+
+## Test Structure Example
+
+```python
+# imports always go ath the head of the module
+import random
+from some_module import some_function
+
+# Fix random seed for reproducibility
+random.seed(42)
+
+# Function to generate test data explicitly
+def generate_random_list_of_ints(n: int, random_seed: int = None):
+    if random_seed is not None:
+        random.seed(random_seed)
+    return [random.randint(1, 100) for _ in range(n)]
+
+def test_some_function():
+    test_data = generate_random_list_of_ints(n=10, random_seed=42)
+    expected_result = sum(test_data)
+    
+    print(f"Testing with data: {test_data}")
+    print(f"Expected sum: {expected_result}")
+    
+    # Call the function
+    result = some_function(test_data)
+    print(f"Actual result: {result}")
+    
+    # Assert the result
+    assert result == expected_result, f"Expected {expected_result}, got {result}"
+    print("Test passed!")
+```
+
+## Key Reminders
+
+- Every test should be self-contained and runnable independently
+- Generate all necessary data within the test function
+- Use descriptive print statements to document test progress
+- Always validate results with proper assert statements
+- Make tests educational - they should teach how the function works
