@@ -1,0 +1,787 @@
+# Technical Specification (Improved)
+
+## Hybrid Tabular Framework: PyTorch Embeddings -> Classical Predictor (Embeddings-Only)
+
+### Project Context
+
+Build a tabular learning framework for a PhD thesis. The idea is to eliminate
+"expert" feature engineering in tabular data machine learning. One passes
+tabular data "as is" to the framework and gets a trained model for prediction.
+The framework uses deep learning to produce embeddings (learned feature
+representations) and then feeds them to classical tabular ML algorithms.
+This combines deep learning flexibility with the strong performance of
+classical models like XGBoost on tabular data -- all without expert feature
+engineering.
+
+---
+
+## 0. Goal
+
+Implement a Python framework that, given a tabular dataset and configuration,
+automatically:
+
+1. Infers schema (numeric / categorical)
+2. Validates input data (defensive checks)
+3. Trains / tunes a PyTorch tabular embedding model
+4. Extracts embeddings for all samples
+5. Tunes / trains a classical predictor on embeddings only
+6. Evaluates and logs results reproducibly across benchmark datasets
+
+**Hard constraints**
+
+* Deep learning: **PyTorch only** (no TensorFlow / Keras)
+* **No manual feature engineering** (no handcrafted features; no expert steps)
+* Classical models must use **embeddings only** as input
+* Tasks: **binary classification, multiclass classification, regression**
+* Hyperparameter tuning: **Hyperopt** (not Optuna, not Ray Tune)
+* Experiment tracking: **no MLflow** (local JSON / CSV / Parquet logging only)
+
+---
+
+## 1. Key Design Principle: "Embeddings-only"
+
+The framework must treat the tabular dataset as "raw" inputs and perform only:
+
+* Minimal **schema-driven normalization** needed for stable training (allowed)
+* Categorical **index mapping** for embedding tables (allowed)
+* Missing-value handling (allowed, but must be non-expert, generic)
+* Input **data validation** -- defensive checks (allowed, generic)
+
+**Forbidden**
+
+* One-hot encoding, target encoding, count encoding
+* Domain feature construction
+* Binning, polynomial features, interactions
+* Feature selection
+* Any custom dataset-specific engineering
+
+---
+
+## 2. Pipeline Overview
+
+**Input**: `X (DataFrame), y (Series/array), task_config, budget_config`
+
+**Output**: `RunResult` + local artifacts folder
+
+### 2.1 Stages
+
+1. **Data validation** (defensive checks)
+2. **Data profiling + schema inference**
+3. **Split generation** (CV or train/val/test)
+4. **HPO split** (one held-out split for both embedding and classical HPO)
+5. **Minimal preprocessing** (fitted on HPO-train only)
+6. **Embedding model HPO** (Hyperopt on HPO-split)
+7. **Classical model HPO** (Hyperopt on HPO-split embeddings)
+8. **Per-fold evaluation** (apply best configs across all K folds)
+9. **Aggregation + reporting**
+10. **Local logging + artifacts**
+
+---
+
+## 3. Supported Tasks (Only)
+
+* Binary classification
+* Multiclass classification
+* Regression
+
+No ranking. No multi-output regression.
+
+---
+
+## 4. Data Validation (Generic, Defensive)
+
+Before any processing, the framework must check:
+
+* **Constant columns** (zero variance) -- drop with warning, since they break
+  StandardScaler and carry no information
+* **All-NaN columns** -- drop with warning
+* **Target variable validity** -- no NaN in y; correct number of classes for
+  the declared task; at least 2 classes for classification
+* **Empty dataset** -- raise error if X has 0 rows or 0 columns after
+  validation
+
+These are generic defensive checks, not expert feature engineering.
+
+---
+
+## 5. Target Variable Handling
+
+### 5.1 Classification
+
+* Binary: infer positive class as the higher-valued label (or alphabetically
+  second for strings). Allow override via config.
+* Multiclass: apply sklearn `LabelEncoder` to map string / non-contiguous
+  integer labels to 0..K-1. Store the encoder for inverse transform.
+
+### 5.2 Regression
+
+* Apply StandardScaler to y (fitted on train split only). This is critical
+  for stable DL training with MSE loss.
+* Store scaler; inverse-transform predictions before evaluation so metrics
+  are in original scale.
+
+---
+
+## 6. Minimal Preprocessing Rules (Generic, Non-expert)
+
+### 6.1 Missing values
+
+* Numeric: fill with train-fold median. 
+* Missingness indicator column allowed and added automatically (if ste to true in run configurations)
+* Categorical: map missing to a dedicated `"__MISSING__"` category index.
+
+### 6.2 Numeric scaling (allowed)
+
+* Default: StandardScaler fitted on train fold only
+* Config toggle: RobustScaler (for datasets with extreme outliers)
+
+### 6.3 Categorical mapping (allowed)
+
+* Per categorical column: fit vocabulary on train fold
+* Unseen values in val/test -> `"__OOV__"` index
+* High-cardinality handling: if a categorical column has cardinality > a
+  configurable threshold (default: 1000), cap the vocabulary to the top-N
+  most frequent values and map the rest to `"__OOV__"`. This is a generic
+  strategy, not domain engineering.
+
+**Important**: Classical models never see categoricals directly. They only
+see learned embedding output vectors.
+
+---
+
+## 7. Embedding Stage (Deep Learning, PyTorch)
+
+### 7.1 Requirements
+
+Embedding stage must output a **fixed-length dense vector** per sample:
+
+* `E in R^(N x d)`
+* Used as the *only* input to classical models.
+
+### 7.2 Device Management
+
+* Auto-detect available device: CUDA > MPS > CPU
+* Allow override via config: `device: "cuda" | "mps" | "cpu" | "auto"`
+* All embedding training happens on the selected device
+* Encoding output is always returned as CPU numpy array (for classical models)
+
+### 7.3 Embedding Sources
+
+#### Mode A -- From-scratch PyTorch architectures (required)
+
+Implement at least:
+
+1. **Tabular MLP with categorical embeddings**
+
+   * Learn embedding tables per categorical feature
+   * Numeric projection layer
+   * Concatenate -> MLP trunk
+   * Output embedding vector from penultimate layer
+
+2. **FT-Transformer-style model** (required for thesis benchmarking)
+
+   * Feature tokenization (numeric as learned linear token; categorical
+     as embedding token)
+   * Transformer encoder
+   * CLS pooled output = embedding
+
+Both must be implemented in native PyTorch.
+
+#### Mode B -- Pre-existing PyTorch tabular frameworks (optional, deferred)
+
+Adapters for external libraries (pytorch-tabular, rtdl, TabNet) are
+deferred to avoid scope creep. The adapter interface is defined so they
+can be added later without refactoring.
+
+**Adapter interface**: All library models must expose:
+
+* `fit(X_train, y_train, X_val, y_val, config)`
+* `encode(X) -> np.ndarray`
+* `save(path)` / `load(path)`
+
+---
+
+## 8. Hyperparameter Optimization (Hyperopt)
+
+### 8.1 CV + HPO interaction (critical design decision)
+
+**Strategy: HPO once, evaluate across folds.**
+
+1. From the K-fold split, designate fold-0 as the HPO split.
+2. Run embedding HPO and classical HPO on fold-0 (train/val).
+3. Record the best embedding config and best classical config.
+4. For all K folds: train embedding model with best config, extract
+   embeddings, train classical model with best config, evaluate on
+   test fold.
+5. Aggregate metrics across K folds (mean +/- std).
+
+Rationale: full HPO per fold is K times more expensive and impractical
+for thesis-scale compute. The single-HPO approach is standard practice
+in AutoML literature. The K-fold evaluation still provides robust
+performance estimates.
+
+### 8.2 General strategy
+
+Use **Hyperopt TPE** with:
+
+* **Epoch-level early stopping** within each trial (monitor validation
+  metric, stop if no improvement for `patience` epochs). This is
+  standard early stopping, not cross-trial pruning.
+* **Time budget** per stage (wall-clock). If budget is exceeded, stop
+  launching new trials and return best result so far.
+
+### 8.3 Objective for embedding HPO
+
+Because embeddings are used downstream, the embedding HPO objective is:
+
+**Primary objective** = validation score of a **proxy classical model
+trained on the extracted embeddings**.
+
+Per trial:
+
+1. Train embedding model on HPO-train (early stop on HPO-val)
+2. Extract embeddings `E_train, E_val`
+3. Train proxy classical model on `E_train`
+4. Score on `E_val`
+5. Return negative score (Hyperopt minimizes)
+
+**Proxy model (configurable)**
+
+* Default for classification: `LogisticRegression(max_iter=1000)`
+* Default for regression: `Ridge()`
+* Optional (config toggle): small LightGBM with few boosting rounds
+  (n_estimators=100). This can better evaluate embeddings destined
+  for tree-based final models, at the cost of slower proxy evaluation.
+
+### 8.4 Search space: From-scratch MLP
+
+Hyperopt should tune:
+
+* embedding_dim (global): 32--256
+* MLP depth: 2--8 layers
+* hidden width: 128--2048
+* dropout: 0--0.5
+* activation: ReLU / GELU / SiLU
+* normalization: LayerNorm on/off
+* lr: log-uniform (1e-5 to 1e-2)
+* weight_decay: log-uniform (1e-6 to 1e-2)
+* batch_size: categorical choices (256, 512, 1024, 2048)
+* optimizer: AdamW (fixed)
+
+### 8.5 Search space: FT-Transformer
+
+* n_layers: 2--6
+* d_model: 64--512
+* n_heads: 4--16 (constrained so d_model % n_heads == 0)
+* attn_dropout: 0--0.3
+* ff_dropout: 0--0.5
+* lr: log-uniform (1e-5 to 1e-3)
+* weight_decay: log-uniform (1e-6 to 1e-2)
+* batch_size: categorical choices (128, 256, 512)
+
+---
+
+## 9. Classical Model Stage (Embeddings-only)
+
+### 9.1 Embedding model retraining for final evaluation
+
+For each CV fold's final evaluation:
+
+1. Train embedding model on fold's train set using best HPO config
+   (with early stopping on fold's val set).
+2. Extract embeddings for train, val, and test sets.
+3. Train classical model on train embeddings.
+4. Evaluate on test embeddings.
+
+The embedding model is NOT retrained on train+val combined. The val set
+is used only for early stopping. This keeps the evaluation clean and
+avoids data leakage concerns.
+
+### 9.2 Allowed classical model families
+
+All consume embedding vectors `E` only.
+
+**Classification**
+
+* LogisticRegression
+* RandomForestClassifier
+* ExtraTreesClassifier
+* XGBoostClassifier
+* LightGBMClassifier
+* CatBoostClassifier
+
+**Regression**
+
+* Ridge
+* ElasticNet
+* RandomForestRegressor
+* ExtraTreesRegressor
+* XGBoostRegressor
+* LightGBMRegressor
+* CatBoostRegressor
+
+Note: CatBoost's main advantage (native categorical handling) is
+irrelevant here since inputs are all-numeric embeddings. It is included
+for completeness but is unlikely to outperform LightGBM/XGBoost.
+
+### 9.3 Classical model tuning (Hyperopt)
+
+Use Hyperopt for:
+
+* Model family selection (categorical choice)
+* Per-family hyperparameters
+
+Implementation:
+
+* `space = hp.choice("model_type", [...])`
+* Each branch has its own param space
+* Objective = validation metric on embeddings
+
+Early stopping for boosted models:
+
+* LightGBM / XGBoost: use built-in early stopping with validation set
+* CatBoost: use built-in early stopping
+
+**Output**
+
+* `best_classical_model` + config
+* Per fold: train on fold-train embeddings, evaluate on fold-test
+
+---
+
+## 10. Evaluation Protocol
+
+### 10.1 Splits
+
+Support:
+
+* K-fold CV (default: 5) -- primary mode
+* Single train/val/test split (optional, for quick debugging)
+
+For K-fold CV, use stratified splits for classification tasks.
+
+### 10.2 Metrics
+
+**Binary classification**
+
+* Primary: ROC-AUC
+* Secondary: log-loss, PR-AUC
+
+**Multiclass**
+
+* Primary: accuracy
+* Secondary: macro-F1, log-loss
+
+**Regression**
+
+* Primary: RMSE
+* Secondary: MAE, R-squared
+
+### 10.3 Reporting
+
+For CV:
+
+* Per-fold metrics
+* Mean +/- std of each metric across folds
+* Best embedding config and best classical config used
+
+---
+
+## 11. Logging (No MLflow)
+
+### 11.1 Local artifacts per run
+
+Output folder structure (CV-aware):
+
+```
+runs/
+  <dataset_id>/
+    run_YYYYMMDD_HHMMSS/
+      config.yaml              # full run configuration
+      schema.json              # inferred schema
+      validation_report.json   # data validation results
+      hpo/
+        embedding_hpo_trials.jsonl
+        classical_hpo_trials.jsonl
+        best_embedding_config.json
+        best_classical_config.json
+      folds/
+        fold_0/
+          embedding_ckpt.pt
+          classical_model.pkl
+          metrics.json
+          predictions.csv      (optional)
+          embeddings.npy        (optional toggle)
+        fold_1/
+          ...
+        fold_K/
+          ...
+      summary_metrics.json     # aggregated mean +/- std
+      stdout.log
+```
+
+### 11.2 Trial logging format
+
+Each Hyperopt trial appended to JSONL:
+
+* trial_id
+* params (full hyperparameter dict)
+* train_time_seconds
+* val_metric_name
+* val_metric_value
+* early_stop_epoch (for embedding trials)
+* embedding_dim_out (for embedding trials)
+* model_type (for classical trials)
+* seed
+
+Must be sufficient for thesis tables and analysis.
+
+---
+
+## 12. Reproducibility & Seed Management
+
+### 12.1 Master seed
+
+* A single `master_seed` in config (default: 42)
+* All randomness is derived from this seed
+
+### 12.2 Seed derivation
+
+* Per-fold seeds: `fold_seed = master_seed + fold_index`
+* Per-trial seeds: `trial_seed = master_seed + trial_id`
+* Applied to: Python `random`, `numpy`, `torch` (manual_seed + cuda)
+
+### 12.3 Deterministic mode
+
+* Set `torch.use_deterministic_algorithms(True)` when config flag
+  `deterministic=True` (default: False, because it can be slower)
+* Always set `torch.manual_seed` and `torch.cuda.manual_seed_all`
+* CV splitter uses `random_state=master_seed`
+
+---
+
+## 13. Required Python Stack
+
+### 13.1 Core
+
+* python >= 3.10
+* numpy
+* pandas
+* scikit-learn
+* scipy
+* pyyaml (for config serialization)
+
+### 13.2 Deep learning
+
+* torch
+
+### 13.3 Classical models
+
+* lightgbm
+* xgboost
+* catboost
+
+### 13.4 HPO
+
+* hyperopt
+
+### 13.5 Serialization
+
+* joblib (sklearn / classical models)
+
+### 13.6 Optional helpers
+
+* openml (dataset fetching for benchmarks)
+
+---
+
+## 14. Package Structure
+
+```
+hybrid_embed/
+  __init__.py
+  config.py                        # dataclasses: TaskConfig, BudgetConfig,
+                                   #   RunConfig, Schema, RunResult
+  utils.py                         # seed management, device helpers, timing
+
+  data/
+    __init__.py
+    validation.py                  # input data validation (defensive checks)
+    schema.py                      # schema inference (numeric/categorical)
+    splits.py                      # CV and single-split generation
+    preprocess.py                  # scaling, missing values, categorical mapping
+
+  embed/
+    __init__.py
+    base.py                        # EmbeddingModel ABC
+    scratch_mlp.py                 # from-scratch MLP
+    scratch_fttransformer.py       # from-scratch FT-Transformer
+    adapters/                      # deferred; interface defined in base.py
+      __init__.py
+
+  classical/
+    __init__.py
+    model_zoo.py                   # model definitions + per-family param spaces
+
+  hpo/
+    __init__.py
+    embed_search.py                # Hyperopt search for embedding models
+    classical_search.py            # Hyperopt search for classical models
+    spaces.py                      # search space definitions
+
+  eval/
+    __init__.py
+    metrics.py                     # metric computation per task type
+    runner.py                      # experiment orchestrator (full pipeline)
+
+  log/
+    __init__.py
+    local_logger.py                # artifact writing, trial JSONL logging
+
+  cli/
+    __init__.py
+    run_benchmark.py               # CLI entry point
+```
+
+---
+
+## 15. Interfaces
+
+### 15.1 EmbeddingModel (ABC)
+
+```python
+from abc import ABC, abstractmethod
+import numpy as np
+
+class EmbeddingModel(ABC):
+    """Base class for all embedding models.
+
+    Follows sklearn-style fit/transform pattern.
+    """
+
+    @abstractmethod
+    def fit(self, X_train, y_train, X_val, y_val, config):
+        """Train the embedding model.
+
+        Parameters
+        ----------
+        X_train : dict
+            Preprocessed train data with keys 'numeric' (np.ndarray)
+            and 'categorical' (np.ndarray of int indices).
+        y_train : np.ndarray
+        X_val : dict
+        y_val : np.ndarray
+        config : dict
+            Hyperparameters for this model.
+
+        Returns
+        -------
+        self
+        """
+
+    @abstractmethod
+    def encode(self, X) -> np.ndarray:
+        """Extract embeddings for given samples.
+
+        Parameters
+        ----------
+        X : dict
+            Same format as fit inputs.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples, embedding_dim)
+        """
+
+    @abstractmethod
+    def save(self, path: str) -> None:
+        """Save model checkpoint."""
+
+    @classmethod
+    @abstractmethod
+    def load(cls, path: str) -> "EmbeddingModel":
+        """Load model from checkpoint."""
+```
+
+### 15.2 Top-level API (sklearn-style)
+
+```python
+class HybridTabularModel:
+    """Main entry point. Sklearn-style fit/predict interface.
+
+    Parameters
+    ----------
+    task : str
+        One of 'binary', 'multiclass', 'regression'.
+    budget_config : BudgetConfig
+        HPO budget and time limits.
+    run_config : RunConfig, optional
+        CV folds, seed, device, logging options.
+    """
+
+    def fit(self, X, y):
+        """Run full pipeline: validate, infer schema, HPO, train."""
+
+    def predict(self, X):
+        """Predict using best embedding + classical model."""
+
+    def predict_proba(self, X):
+        """Predict probabilities (classification only)."""
+```
+
+This class is the user-facing API. Internally it delegates to the
+pipeline stages. It does NOT aim for full sklearn estimator compliance
+(no `get_params`/`set_params`/estimator checks) -- just the familiar
+`fit`/`predict`/`predict_proba` interface.
+
+### 15.3 Experiment runner (for benchmarking)
+
+```python
+def run_experiment(X, y, task_config, budget_config, run_config) -> RunResult:
+    """Run full experiment with CV, HPO, evaluation, and logging.
+
+    This is the function used for thesis benchmarking. It orchestrates
+    the entire pipeline and produces the artifact folder.
+    """
+```
+
+---
+
+## 16. Recommended Defaults (for thesis benchmarking)
+
+* 5-fold stratified CV (classification) / 5-fold CV (regression)
+* Embedding HPO: 30--60 trials, max 50 epochs, patience 8
+* Classical HPO: 80--200 trials across all model families
+* Proxy model for embedding search:
+  * classification: LogisticRegression
+  * regression: Ridge
+* Save embeddings toggle: OFF by default (disk heavy)
+* Device: "auto"
+* Master seed: 42
+* Deterministic mode: False
+
+These defaults are tuned for moderate-sized datasets (1k--100k rows).
+For very small or very large datasets, adjust max_epochs and trial
+counts accordingly via config.
+
+---
+
+## 17. Acceptance Criteria (Definition of Done)
+
+Framework is complete when:
+
+1. **End-to-end runs** on at least:
+   * Adult (binary classification)
+   * A multiclass dataset (e.g., Covertype or similar from OpenML)
+   * California Housing (regression)
+
+2. **Implements**:
+   * From-scratch MLP embedding + Hyperopt search
+   * From-scratch FT-Transformer embedding + Hyperopt search
+   * Classical model Hyperopt tuning on embeddings
+   * Full K-fold CV evaluation pipeline
+
+3. **Produces**:
+   * Reproducible metrics and artifact folder per run
+   * CV summary table for multiple datasets
+   * JSONL trial logs suitable for thesis tables
+
+4. **Ensures**:
+   * Classical models consume embeddings only (verified in code)
+   * No engineered features created anywhere
+   * All results are reproducible given the same seed
+
+5. **Code quality**:
+   * All modules documented with numpy-style docstrings
+   * All modules covered with unit tests (see Section 19)
+   * Data validation catches degenerate inputs gracefully
+
+---
+
+## 18. Non-negotiable Code Quality Requirements
+
+* **Documentation**: numpy-style docstrings on all public classes,
+  methods, and functions. This is a scientific project; documentation
+  is a first-class concern.
+* **API style**: sklearn-style `fit` / `predict` / `encode` interfaces
+  on all components. The top-level `HybridTabularModel` class provides
+  the familiar sklearn interface for end users.
+* **Unit tests**: full coverage following the testing guidelines in
+  Section 19.
+
+---
+
+## 19. Unit Testing Guidelines
+
+### Framework
+
+This project uses **pytest** as the testing framework.
+
+### Forbidden Practices
+
+1. **No fixtures** -- NEVER use pytest fixtures. All test data must be
+   generated explicitly within each test function or in module-level
+   helper functions.
+2. **Avoid mocks** whenever possible. Prefer testing with real (small,
+   synthetic) data.
+
+### Data Generation
+
+* When a tested function needs data, generate random data **explicitly**
+  in the test module using `random`, `numpy`, `pandas`.
+* Fix random seeds for reproducibility.
+* Make data generation visible and understandable.
+
+### Demo-Purpose Testing
+
+Unit tests serve dual purposes:
+
+* **Testing functionality**: verify correctness with assertions.
+* **Documentation**: serve as live examples of how functions work.
+
+Tests should be structured so that anyone can open an ipython console,
+run the test code piece by piece, and understand function inputs,
+outputs, and behavior.
+
+### Print Statements for Visibility
+
+* Include `print()` statements showing what the test does, intermediate
+  values, and results.
+* Prints are for debugging and visibility, NOT substitutes for `assert`.
+* All tests must use proper `assert` statements for validation.
+
+### Test Structure Example
+
+```python
+import numpy as np
+from hybrid_embed.data.schema import infer_schema
+
+def generate_mixed_dataframe(n_rows, random_seed=42):
+    rng = np.random.RandomState(random_seed)
+    return pd.DataFrame({
+        "age": rng.randint(18, 80, size=n_rows),
+        "income": rng.normal(50000, 15000, size=n_rows),
+        "city": rng.choice(["NYC", "LA", "CHI"], size=n_rows),
+    })
+
+def test_infer_schema_detects_categorical():
+    df = generate_mixed_dataframe(n_rows=100, random_seed=42)
+    print(f"DataFrame columns: {list(df.columns)}")
+    print(f"Dtypes:\n{df.dtypes}")
+
+    schema = infer_schema(df)
+    print(f"Inferred schema: {schema}")
+
+    assert "city" in schema.categorical_columns
+    assert "age" in schema.numeric_columns
+    assert "income" in schema.numeric_columns
+    print("Test passed: schema correctly identified column types")
+```
+
+### Key Principles
+
+* Every test is self-contained and runnable independently
+* All data generated within the test
+* Descriptive prints document test progress
+* Proper assert statements validate results
+* Tests teach how the function works
