@@ -73,10 +73,39 @@ T01 (scaffolding)
 **Dependencies**: None
 **Spec reference**: Section 13 (Python Stack), Section 14 (Package Structure)
 
-**Objective**: Create the project directory structure, dependency files,
-and empty `__init__.py` files so the package is importable.
+**Objective**: Create the Python virtual environment, project directory
+structure, dependency files, and empty `__init__.py` files so the
+package is installable and importable.
 
 **Deliverables**:
+
+0. **Python virtual environment** (venv):
+
+   Create the environment using the standard library `venv` module.
+   Use Python 3.11 (the project requires >= 3.10; 3.11 is the
+   recommended version for stability and compatibility with all
+   dependencies).
+
+   Steps the agent must execute:
+   ```
+   python3.11 -m venv .venv
+   source .venv/bin/activate
+   pip install --upgrade pip setuptools wheel
+   ```
+
+   The `.venv/` directory must be added to `.gitignore`.
+
+   After the venv is created and activated, all subsequent commands
+   in this task (and all future tasks) must run inside this venv.
+
+   Also create a `.python-version` file at the repo root containing:
+   ```
+   3.11
+   ```
+
+   Note for macOS Apple Silicon: `pip install torch` will
+   automatically install the MPS-capable build. No special index
+   URL is needed.
 
 1. `pyproject.toml` with:
    - Project name: `hybrid_embed`
@@ -84,7 +113,7 @@ and empty `__init__.py` files so the package is importable.
    - Dependencies (do NOT pin exact versions, use >= with minimum):
      numpy, pandas, scikit-learn, scipy, pyyaml, torch, lightgbm,
      xgboost, catboost, hyperopt, joblib
-   - Dev dependencies: pytest
+   - Dev dependencies (optional group "dev"): pytest
    - Optional dependencies group "benchmarks": openml
 
 2. Directory tree with empty `__init__.py` in every package:
@@ -123,17 +152,28 @@ and empty `__init__.py` files so the package is importable.
        __init__.py
    ```
 
-3. A minimal `README.md` (3-5 lines: project name, one-line
-   description, how to install with `pip install -e .`).
+3. A minimal `README.md` with:
+   - Project name and one-line description
+   - Setup instructions:
+     ```
+     python3.11 -m venv .venv
+     source .venv/bin/activate
+     pip install -e ".[dev]"
+     ```
+   - How to run tests: `pytest tests/`
 
-4. A `.gitignore` for Python projects (include `runs/`, `*.pyc`,
-   `__pycache__/`, `.eggs/`, `*.egg-info/`, `dist/`, `build/`).
+4. A `.gitignore` for Python projects (include `runs/`, `.venv/`,
+   `*.pyc`, `__pycache__/`, `.eggs/`, `*.egg-info/`, `dist/`,
+   `build/`).
 
 **Acceptance criteria**:
-- `pip install -e .` succeeds
+- `.venv/` exists and contains a working Python 3.11 environment
+- `.python-version` file exists with content `3.11`
+- `pip install -e ".[dev]"` succeeds inside the venv
 - `import hybrid_embed` works without error
 - All sub-packages importable: `from hybrid_embed.data import *` etc.
 - `pytest tests/` runs (0 tests collected, no errors)
+- `.venv/` is listed in `.gitignore`
 
 ---
 
