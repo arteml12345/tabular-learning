@@ -232,9 +232,58 @@ embedding = EmbeddingStepConfig(
 
 Both Mode A and Mode B models implement `EmbeddingModel`:
 
-* `fit(X_train, y_train, X_val, y_val, config)`
-* `encode(X) -> np.ndarray`
+* `fit(X_train, y_train, X_val, y_val, config)` -- train as a full
+  standalone predictor (with prediction head)
+* `predict(X)` / `predict_proba(X)` -- predict using the full model
+  (used during HPO to evaluate the model's quality)
+* `encode(X) -> np.ndarray` -- extract embeddings from the
+  intermediate layer (used after HPO to feed classical models)
 * `save(path)` / `load(path)`
+
+### 7.4 Embedding Extraction
+
+The embedding model is trained as a full predictor (input -> hidden
+layers -> prediction head). After training, embeddings are extracted
+from an intermediate layer -- the model's learned internal
+representation.
+
+#### MLP (Mode A)
+
+Architecture: `[input -> hidden_1 -> ... -> hidden_n -> pred_head]`
+
+Extraction point is configurable via `EmbeddingStepConfig.fixed_params`:
+* `embedding_layer: int` -- index of the hidden layer to extract from.
+  Default: -1 (penultimate layer, i.e., the last hidden layer before
+  the prediction head). Can be set to any valid layer index.
+
+The output of the specified hidden layer (after activation) is the
+embedding vector.
+
+#### pytorch-tabular models (Mode B)
+
+All pytorch-tabular models share a common architecture:
+
+    [Embedding layer] -> [Backbone] -> [Head]
+
+* **Embedding layer**: encodes categorical (learned embeddings) and
+  continuous (linear projection) features
+* **Backbone**: model-specific layers (transformer blocks for
+  TabTransformer, attention steps for TabNet, gating for GATE, etc.)
+* **Head**: final linear layer(s) for prediction
+
+Extraction point: **backbone output** (before the head). This is
+consistent across all pytorch-tabular models and is exposed by the
+library's architecture. The adapter hooks into the backbone output
+to extract embeddings.
+
+| Model             | Backbone output (= embedding)              |
+|-------------------|---------------------------------------------|
+| TabTransformer    | Concatenated contextual column embeddings   |
+|                   | after all transformer blocks                |
+| TabNet            | Aggregated feature representation after     |
+|                   | all attention steps                         |
+| CategoryEmbedding | Last hidden layer before prediction head    |
+| GATE              | Gated output before prediction head         |
 
 ---
 
@@ -269,26 +318,27 @@ Use **Hyperopt TPE** with:
 
 ### 8.3 Objective for embedding HPO
 
-Because embeddings are used downstream, the embedding HPO objective is:
-
-**Primary objective** = validation score of a **proxy classical model
-trained on the extracted embeddings**.
+The embedding model is trained as a **standalone predictor** -- it
+learns to solve the actual task (classification / regression) end-to-end,
+as if there is no classical step. The HPO objective is the model's own
+validation score.
 
 Per trial:
 
-1. Train embedding model on HPO-train (early stop on HPO-val)
-2. Extract embeddings `E_train, E_val`
-3. Train proxy classical model on `E_train`
-4. Score on `E_val`
-5. Return negative score (Hyperopt minimizes)
+1. Train embedding model on HPO-train as a full predictor
+   (with prediction head + epoch-level early stopping on HPO-val)
+2. Compute the model's validation metric (roc_auc / accuracy / rmse)
+3. Return negative score (Hyperopt minimizes)
 
-**Proxy model (configurable)**
+After HPO finds the best config, the best model is retrained and
+embeddings are extracted from an intermediate layer (see Section 7.4).
+The classical model then consumes these embeddings.
 
-* Default for classification: `LogisticRegression(max_iter=1000)`
-* Default for regression: `Ridge()`
-* Optional (config toggle): small LightGBM with few boosting rounds
-  (n_estimators=100). This can better evaluate embeddings destined
-  for tree-based final models, at the cost of slower proxy evaluation.
+Rationale: training the NN to solve the actual task produces
+representations that capture the structure of the problem. These
+learned internal representations are the embeddings. No proxy model
+is needed -- the model's own prediction quality directly indicates
+how good its learned representations are.
 
 ### 8.4 Search spaces
 
@@ -342,9 +392,11 @@ replace the entire space for the selected model.
 
 For each CV fold's final evaluation:
 
-1. Train embedding model on fold's train set using best HPO config
-   (with early stopping on fold's val set).
-2. Extract embeddings for train, val, and test sets.
+1. Train embedding model on fold's train set as a **standalone
+   predictor** using best HPO config (with early stopping on
+   fold's val set).
+2. Extract embeddings from the model's intermediate layer
+   (see Section 7.4) for train, val, and test sets.
 3. Train classical model on train embeddings.
 4. Evaluate on test embeddings.
 
@@ -641,12 +693,14 @@ import numpy as np
 class EmbeddingModel(ABC):
     """Base class for all embedding models.
 
-    Follows sklearn-style fit/transform pattern.
+    Each model is trained as a standalone predictor (with a prediction
+    head for the target task). After training, embeddings are extracted
+    from an intermediate layer (see Section 7.4).
     """
 
     @abstractmethod
     def fit(self, X_train, y_train, X_val, y_val, config):
-        """Train the embedding model.
+        """Train the model as a standalone predictor.
 
         Parameters
         ----------
@@ -665,8 +719,16 @@ class EmbeddingModel(ABC):
         """
 
     @abstractmethod
+    def predict(self, X) -> np.ndarray:
+        """Predict using the full model (used during HPO)."""
+
+    def predict_proba(self, X) -> np.ndarray:
+        """Predict probabilities (classification only)."""
+        raise NotImplementedError
+
+    @abstractmethod
     def encode(self, X) -> np.ndarray:
-        """Extract embeddings for given samples.
+        """Extract embeddings from intermediate layer.
 
         Parameters
         ----------
@@ -813,9 +875,6 @@ def run_experiment(
 * 5-fold stratified CV (classification) / 5-fold CV (regression)
 * Embedding HPO: 30--60 trials, max 50 epochs, patience 8
 * Classical HPO: 80--200 trials for the selected model
-* Proxy model for embedding search:
-  * classification: LogisticRegression
-  * regression: Ridge
 * Save embeddings toggle: OFF by default (disk heavy)
 * Device: "auto"
 * Master seed: 42

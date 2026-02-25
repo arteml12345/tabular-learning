@@ -338,11 +338,6 @@ class RunConfig:
         Categories with more unique values than this cap get
         rare values collapsed into __OOV__. Prevents huge
         embedding tables for high-cardinality columns.
-    proxy_model : str
-        Lightweight model used during embedding HPO to evaluate
-        embedding quality. "linear" = LogisticRegression / Ridge
-        (fast, stable). "lightgbm" = small LightGBM (better for
-        embeddings destined for tree-based final models, slower).
     add_missing_indicator : bool
         When True, adds a binary column per feature indicating
         whether the original value was missing (before imputation).
@@ -357,7 +352,6 @@ class RunConfig:
     dataset_id: str = "default"
     scaler: str = "standard"
     max_categorical_cardinality: int = 1000
-    proxy_model: str = "linear"
     add_missing_indicator: bool = False
 
 @dataclass
@@ -1076,8 +1070,37 @@ class EmbeddingModel(ABC):
         """
 
     @abstractmethod
+    def predict(self, X: dict) -> np.ndarray:
+        """Predict using the full model (for HPO evaluation).
+
+        Parameters
+        ----------
+        X : dict (same format as fit)
+
+        Returns
+        -------
+        np.ndarray of predictions
+        """
+
+    def predict_proba(self, X: dict) -> np.ndarray:
+        """Predict probabilities (classification only).
+
+        Default raises NotImplementedError. Subclasses for
+        classification tasks should override.
+
+        Returns
+        -------
+        np.ndarray of shape (n_samples, n_classes)
+        """
+        raise NotImplementedError
+
+    @abstractmethod
     def encode(self, X: dict) -> np.ndarray:
-        """Extract embeddings.
+        """Extract embeddings from intermediate layer.
+
+        The model is trained as a standalone predictor. This method
+        returns the learned internal representation from a specific
+        layer (see Section 7.4 of the spec).
 
         Parameters
         ----------
@@ -1157,14 +1180,17 @@ Implement two classes: the PyTorch `nn.Module` and the
 class TabularMLP(nn.Module):
     """PyTorch module: MLP with categorical embedding tables.
 
+    Trained as a standalone predictor for the target task. After
+    training, embeddings are extracted from a configurable
+    intermediate hidden layer.
+
     Architecture:
     1. Per-categorical-column embedding table (nn.Embedding)
     2. Numeric input: optional linear projection to match embedding dim
     3. Concatenate all embeddings + numeric projection
     4. MLP trunk: sequence of [Linear -> Norm? -> Activation -> Dropout]
-    5. Output head: Linear -> output (for training loss)
-    6. Embedding extraction point: output of last hidden layer
-       (penultimate layer, before the output head)
+       (hidden layers indexed 0..n-1)
+    5. Output head: Linear -> task output (for training loss)
 
     Parameters
     ----------
@@ -1183,13 +1209,22 @@ class TabularMLP(nn.Module):
         "binary", "multiclass", "regression"
     n_classes : int or None
         Number of classes (for classification output head).
+    embedding_layer : int
+        Index of hidden layer to extract embeddings from.
+        Default: -1 (last hidden layer, before prediction head).
+        Can be any valid index into hidden_dims.
     """
 
     def forward(self, x_numeric, x_categorical):
-        """Full forward pass (for training). Returns task output."""
+        """Full forward pass (for training). Returns task prediction."""
 
     def encode(self, x_numeric, x_categorical):
-        """Forward pass up to penultimate layer. Returns embedding."""
+        """Forward pass up to embedding_layer. Returns embedding vector.
+
+        Runs input through the MLP trunk up to (and including) the
+        layer at index self.embedding_layer, returns that layer's
+        activated output.
+        """
 
 
 class MLPEmbeddingModel(EmbeddingModel):
@@ -1213,18 +1248,28 @@ class MLPEmbeddingModel(EmbeddingModel):
     """
 
     def fit(self, X_train, y_train, X_val, y_val, config):
-        """Train the MLP.
+        """Train the MLP as a standalone predictor.
 
         Training loop:
-        1. Build model from config
+        1. Build model from config (including embedding_layer)
         2. Create DataLoaders
-        3. Train with AdamW optimizer
-        4. Early stopping on validation loss
+        3. Train with AdamW optimizer to minimize task loss
+        4. Early stopping on validation metric (roc_auc, accuracy,
+           or rmse depending on task)
         5. Restore best weights
+        """
 
-        The validation metric used for early stopping is the task
-        loss (not the downstream proxy metric -- that is handled
-        by the HPO layer).
+    def predict(self, X):
+        """Predict using the full model (input -> prediction head).
+
+        Returns raw predictions (logits for classification,
+        values for regression).
+        """
+
+    def predict_proba(self, X):
+        """Predict probabilities (classification only).
+
+        Returns array of shape (n_samples, n_classes).
         """
 
     def encode(self, X):
@@ -1242,10 +1287,14 @@ class MLPEmbeddingModel(EmbeddingModel):
 
 - Loss function: BCEWithLogitsLoss (binary), CrossEntropyLoss
   (multiclass), MSELoss (regression).
-- Early stopping: track validation loss. If no improvement for
-  `patience` epochs, stop and restore best weights.
-- Encoding: use `model.encode()` (penultimate layer output) in
-  eval mode with `torch.no_grad()`.
+- Early stopping: track validation metric (roc_auc for binary,
+  accuracy for multiclass, -rmse for regression). If no improvement
+  for `patience` epochs, stop and restore best weights.
+- Embedding extraction: use `model.encode()` which runs the forward
+  pass up to `embedding_layer` and returns that layer's output.
+  Done in eval mode with `torch.no_grad()`.
+- `embedding_layer` default: -1 (last hidden layer before prediction
+  head). User can override via `fixed_params={"embedding_layer": 2}`.
 - Batch encoding: process in batches to avoid OOM on large datasets.
   Default encoding batch size: 4096.
 - Device: move model and data to config["device"].
@@ -1355,7 +1404,11 @@ class PytorchTabularEmbeddingModel(EmbeddingModel):
         ...
 
     def fit(self, X_train, y_train, X_val, y_val, config):
-        """Train via pytorch-tabular.
+        """Train as a standalone predictor via pytorch-tabular.
+
+        The model is trained end-to-end to solve the actual task
+        (classification / regression). pytorch-tabular handles
+        the training loop, loss function, and early stopping.
 
         Steps:
         1. Convert preprocessed dicts to DataFrames
@@ -1363,15 +1416,33 @@ class PytorchTabularEmbeddingModel(EmbeddingModel):
            OptimizerConfig from the config dict
         3. Instantiate TabularModel
         4. Call tabular_model.fit(train=train_df, validation=val_df)
-        5. Store the trained model for later encoding
+        5. Store the trained model for later predict/encode
         """
+
+    def predict(self, X):
+        """Predict using the full model (backbone + head).
+
+        Uses pytorch-tabular's predict method.
+        """
+
+    def predict_proba(self, X):
+        """Predict probabilities (classification only)."""
 
     def encode(self, X):
         """Extract embeddings from the trained model's backbone.
 
-        Uses pytorch-tabular's model to get the backbone output
-        (before the final prediction head). This is the
-        penultimate-layer representation.
+        All pytorch-tabular models have the architecture:
+            [Embedding layer] -> [Backbone] -> [Head]
+
+        This method extracts the backbone output (before the
+        prediction head). This is consistent across all model types:
+
+        - TabTransformer: concatenated contextual column embeddings
+          after all transformer blocks
+        - TabNet: aggregated feature representation after all
+          attention steps
+        - CategoryEmbedding: last hidden layer before head
+        - GATE: gated output before head
 
         Returns numpy array of shape (n_samples, embedding_dim).
         """
@@ -1757,7 +1828,6 @@ def hyperopt_search_embedding(
     n_categories_per_column: list[int],
     n_classes: int | None,
     embedding_step: EmbeddingStepConfig,
-    proxy_model: str = "linear",
     max_trials: int = 50,
     max_epochs: int = 50,
     patience: int = 8,
@@ -1768,19 +1838,19 @@ def hyperopt_search_embedding(
 ) -> dict:
     """Run Hyperopt TPE search for the selected embedding model's HPs.
 
-    Tunes the ONE model specified in embedding_step.model_type
-    within its search space (user-provided or default).
+    The model is trained as a standalone predictor (with prediction
+    head). The HPO objective is the model's own validation score --
+    no proxy model is used.
 
     Per trial:
     1. Sample hyperparameters from the search space.
     2. Merge with embedding_step.fixed_params.
     3. Postprocess params.
-    4. Build and train embedding model (with early stopping).
-    5. Extract embeddings for train and val.
-    6. Train proxy model on embeddings.
-    7. Score proxy model on val embeddings.
-    8. Log trial to logger (if provided).
-    9. Return negative score for Hyperopt.
+    4. Build and train embedding model as a full predictor
+       (with prediction head + epoch-level early stopping).
+    5. Evaluate model's validation metric (roc_auc / accuracy / rmse).
+    6. Log trial to logger (if provided).
+    7. Return negative score for Hyperopt (Hyperopt minimizes).
 
     Returns
     -------
@@ -1789,33 +1859,6 @@ def hyperopt_search_embedding(
         "best_score": float (best validation metric value)
         "n_trials_completed": int
         "total_time_seconds": float
-    """
-```
-
-**Proxy model logic**:
-
-```
-def _build_proxy_model(task: str, proxy_type: str):
-    """Build the proxy model used to evaluate embedding quality.
-
-    proxy_type "linear":
-        classification -> LogisticRegression(max_iter=1000)
-        regression -> Ridge()
-
-    proxy_type "lightgbm":
-        classification -> LGBMClassifier(n_estimators=100, verbose=-1)
-        regression -> LGBMRegressor(n_estimators=100, verbose=-1)
-    """
-
-def _evaluate_embeddings(
-    E_train, y_train, E_val, y_val, task, proxy_type
-) -> float:
-    """Train proxy model on embeddings, return validation score.
-
-    Uses the primary metric for the task (roc_auc, accuracy, rmse).
-    For regression (where lower is better), negate so that higher
-    is always better (Hyperopt minimizes, so we negate again in
-    the objective).
     """
 ```
 
@@ -1834,9 +1877,8 @@ Generate small synthetic preprocessed data (100 train, 30 val,
   n_trials < 1000.
 - `test_embedding_search_logs_trials`: provide a logger, run 3
   trials. Assert 3 lines in the JSONL file.
-- `test_proxy_model_linear_classification`: train proxy on random
-  embeddings, assert returns a float score.
-- `test_proxy_model_linear_regression`: same for regression.
+- `test_embedding_search_score_improves`: run 5 trials, assert
+  best_score is a valid float for the task metric.
 
 Note: these tests use small data and few trials to run fast.
 They verify the machinery works, not the quality of the search.
