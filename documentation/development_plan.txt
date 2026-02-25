@@ -256,48 +256,142 @@ All classes must have numpy-style docstrings.
 ```
 @dataclass
 class Schema:
+    """Inferred column type information for a dataset.
+
+    Populated by the schema inference step (spec Section 5).
+    Used downstream by preprocessing, embedding models, and
+    the pytorch-tabular adapter.
+
+    Parameters
+    ----------
+    numeric_columns : list[str]
+        Column names identified as numeric (int/float).
+    categorical_columns : list[str]
+        Column names identified as categorical (object/string/
+        low-cardinality int).
+    dropped_columns : list[str]
+        Columns removed during data validation (constant columns,
+        all-NaN columns). Tracked for reproducibility and logging.
+    """
     numeric_columns: list[str]
     categorical_columns: list[str]
-    # columns dropped during validation (constant, all-NaN)
     dropped_columns: list[str] = field(default_factory=list)
 
 @dataclass
 class TaskConfig:
-    task: str  # "binary", "multiclass", "regression"
+    """Specifies the prediction task type.
+
+    Parameters
+    ----------
+    task : str
+        One of "binary", "multiclass", "regression".
+    target_column : str or None
+        Name of the target column when loading from CSV/DataFrame.
+        None when target is passed separately as y.
+    positive_class : Any or None
+        For binary classification: override which label is treated
+        as the positive class. If None, the framework infers it
+        as the higher-valued (or alphabetically second) label.
+    """
+    task: str
     target_column: str | None = None
-    # for binary: override positive class label
     positive_class: Any = None
 
 @dataclass
 class BudgetConfig:
-    # Embedding HPO
+    """HPO budget limits for both embedding and classical stages.
+
+    Controls how much compute Hyperopt is allowed to spend.
+    Time budgets are wall-clock limits; if exceeded, Hyperopt
+    stops launching new trials and returns the best result so far.
+
+    Parameters
+    ----------
+    embed_hpo_max_trials : int
+        Maximum number of Hyperopt trials for the embedding model.
+    embed_max_epochs : int
+        Maximum training epochs per embedding trial (early stopping
+        may stop sooner).
+    embed_patience : int
+        Early stopping patience (epochs without improvement).
+    embed_time_budget_seconds : float or None
+        Wall-clock time limit for embedding HPO. None = no limit.
+    classical_hpo_max_trials : int
+        Maximum number of Hyperopt trials for the classical model.
+    classical_time_budget_seconds : float or None
+        Wall-clock time limit for classical HPO. None = no limit.
+    """
     embed_hpo_max_trials: int = 50
     embed_max_epochs: int = 50
     embed_patience: int = 8
     embed_time_budget_seconds: float | None = None
-    # Classical HPO
     classical_hpo_max_trials: int = 150
     classical_time_budget_seconds: float | None = None
 
 @dataclass
 class EmbeddingStepConfig:
+    """Configuration for the embedding model step.
+
+    The user selects ONE embedding model per experiment and
+    optionally provides a custom HP search space and/or fixed
+    parameters. If search_space is None, the framework uses the
+    built-in default space for the selected model_type.
+
+    Parameters
+    ----------
+    model_type : str
+        Mode A (from-scratch): "mlp"
+        Mode B (pytorch-tabular): "tab_transformer", "tabnet",
+            "gate", "category_embedding"
+    search_space : dict or None
+        Hyperopt search space for this model's hyperparameters.
+        If None, uses the built-in default space for model_type.
+    fixed_params : dict or None
+        Parameters always passed to the model (not tuned).
+        These override defaults and are merged with HPO-sampled
+        params. For MLP, can include "embedding_layer" to control
+        which hidden layer embeddings are extracted from.
+    """
     model_type: str = "mlp"
-    # "mlp" (Mode A) or pytorch-tabular model name (Mode B):
-    # "tab_transformer", "tabnet", "gate", "category_embedding"
-    search_space: dict | None = None   # None = use built-in defaults
-    fixed_params: dict | None = None   # always passed, not tuned
+    search_space: dict | None = None
+    fixed_params: dict | None = None
 
 @dataclass
 class ClassicalStepConfig:
+    """Configuration for the classical model step.
+
+    The user selects ONE classical model per experiment. The
+    framework ships with default HP spaces for common models
+    (spec Section 9.2). The user can also provide any
+    sklearn-compatible class via model_type="custom".
+
+    Parameters
+    ----------
+    model_type : str
+        Built-in models (each has a default HP space):
+        "logistic_regression", "ridge", "elastic_net",
+        "random_forest", "extra_trees", "xgboost", "lightgbm",
+        "catboost".
+        Custom: "custom" (must also set model_class and
+        search_space).
+    model_class : type or None
+        Required when model_type="custom". Must be
+        sklearn-compatible (fit/predict/predict_proba).
+    search_space : dict or None
+        Hyperopt search space. If None, uses the built-in
+        default space for model_type.
+    fixed_params : dict or None
+        Parameters always passed to the constructor (not tuned).
+    supports_early_stopping : bool or None
+        If True, framework passes eval_set and
+        early_stopping_rounds to fit(). None = auto-detect
+        (True for xgboost/lightgbm/catboost, False otherwise).
+    """
     model_type: str = "xgboost"
-    # Built-in: "xgboost", "lightgbm", "catboost", "ridge",
-    #   "logistic_regression", "random_forest", "extra_trees",
-    #   "elastic_net"
-    # Custom: "custom" (must set model_class)
-    model_class: type | None = None  # required if model_type="custom"
-    search_space: dict | None = None   # None = use built-in defaults
+    model_class: type | None = None
+    search_space: dict | None = None
     fixed_params: dict | None = None
-    supports_early_stopping: bool | None = None  # None = auto-detect
+    supports_early_stopping: bool | None = None
 
 @dataclass
 class RunConfig:
@@ -361,19 +455,59 @@ class RunConfig:
 
 @dataclass
 class FoldResult:
+    """Results from a single CV fold evaluation.
+
+    Parameters
+    ----------
+    fold_index : int
+        Which fold this result corresponds to (0-based).
+    metrics : dict[str, float]
+        Metric name -> value for this fold (e.g., {"roc_auc": 0.93}).
+    predictions : np.ndarray or None
+        Per-sample predictions for this fold's test set.
+        Populated only if RunConfig.save_predictions is True.
+    embedding_dim : int
+        Dimensionality of the embedding vectors produced by the
+        embedding model for this fold.
+    """
     fold_index: int
     metrics: dict[str, float]
-    # populated if save_predictions is True
     predictions: np.ndarray | None = None
     embedding_dim: int = 0
 
 @dataclass
 class RunResult:
+    """Complete results from a run_experiment() call.
+
+    Contains per-fold results, aggregated metrics (mean +/- std
+    across folds), and the best HP configs found during HPO.
+    This is the primary output used for thesis reporting.
+
+    Parameters
+    ----------
+    task : str
+        The task type ("binary", "multiclass", "regression").
+    dataset_id : str
+        Label identifying the dataset used.
+    n_folds : int
+        Number of CV folds used.
+    fold_results : list[FoldResult]
+        Per-fold evaluation results.
+    mean_metrics : dict[str, float]
+        Mean of each metric across all folds.
+    std_metrics : dict[str, float]
+        Standard deviation of each metric across all folds.
+    best_embedding_config : dict
+        Best embedding HP config found during HPO on fold-0.
+    best_classical_config : dict
+        Best classical HP config found during HPO on fold-0.
+    total_time_seconds : float
+        Total wall-clock time for the entire experiment.
+    """
     task: str
     dataset_id: str
     n_folds: int
     fold_results: list[FoldResult]
-    # aggregated
     mean_metrics: dict[str, float]
     std_metrics: dict[str, float]
     best_embedding_config: dict
@@ -445,6 +579,27 @@ defensive checks that run before any processing.
 ```
 @dataclass
 class ValidationReport:
+    """Results from the data validation step (spec Section 4).
+
+    Records which columns were dropped and why, along with
+    dataset size information. Saved to validation_report.json
+    for reproducibility.
+
+    Parameters
+    ----------
+    dropped_constant_columns : list[str]
+        Columns dropped because they had zero variance.
+    dropped_allnan_columns : list[str]
+        Columns dropped because all values were NaN.
+    warnings : list[str]
+        Human-readable warning messages generated during validation.
+    n_rows : int
+        Number of rows in the dataset.
+    n_cols_original : int
+        Number of columns before validation drops.
+    n_cols_after : int
+        Number of columns after validation drops.
+    """
     dropped_constant_columns: list[str]
     dropped_allnan_columns: list[str]
     warnings: list[str]
@@ -597,6 +752,24 @@ K-fold CV splits and single train/val/test splits.
 ```
 @dataclass
 class FoldSplit:
+    """Index arrays defining a single train/val/test split.
+
+    Used by both K-fold CV and single-split modes.
+    All indices refer to positions in the original dataset.
+
+    Parameters
+    ----------
+    fold_index : int
+        Which fold this split belongs to (0-based). Fold 0 is
+        used as the HPO split in K-fold mode.
+    train_indices : np.ndarray
+        Row indices for the training set.
+    val_indices : np.ndarray
+        Row indices for the validation set (used for early
+        stopping during training).
+    test_indices : np.ndarray
+        Row indices for the test set (used for evaluation only).
+    """
     fold_index: int
     train_indices: np.ndarray
     val_indices: np.ndarray
