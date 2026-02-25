@@ -40,7 +40,7 @@ T01 (scaffolding)
  |                               |       |
  |                               |       +---> T11 (MLP)
  |                               |       |
- |                               |       +---> T12 (FT-Transformer)
+ |                               |       +---> T12 (TabTransformer)
  |                               |       |
  +---> T08 (metrics) ------------+       |
  |                               |       v
@@ -164,7 +164,7 @@ package is installable and importable.
 
 4. A `.gitignore` for Python projects (include `runs/`, `.venv/`,
    `*.pyc`, `__pycache__/`, `.eggs/`, `*.egg-info/`, `dist/`,
-   `build/`).
+   `build/`, `.DS_Store`).
 
 **Acceptance criteria**:
 - `.venv/` exists and contains a working Python 3.11 environment
@@ -1216,66 +1216,79 @@ Tests:
 
 ---
 
-### TASK T12: FT-Transformer Embedding Model
+### TASK T12: TabTransformer Embedding Model
 
 **Dependencies**: T10, T02, T07
 **Spec reference**: Section 7.3 Mode A item 2, Section 8.5
 
-**Objective**: Implement `hybrid_embed/embed/scratch_fttransformer.py`
--- an FT-Transformer model for tabular data.
+**Objective**: Implement `hybrid_embed/embed/scratch_tabtransformer.py`
+-- a TabTransformer model (Huang et al., 2020) for tabular data.
 
 **Deliverables**:
-- `hybrid_embed/embed/scratch_fttransformer.py`
-- `tests/embed/test_scratch_fttransformer.py`
+- `hybrid_embed/embed/scratch_tabtransformer.py`
+- `tests/embed/test_scratch_tabtransformer.py`
 
 **Detailed requirements**:
 
 ```
-class FTTransformer(nn.Module):
-    """Feature Tokenizer + Transformer for tabular data.
+class TabTransformer(nn.Module):
+    """TabTransformer for tabular data (Huang et al., 2020).
 
     Architecture:
-    1. Feature tokenization:
-       - Numeric features: each feature -> linear projection to d_model
-         (learned scalar-to-vector mapping per feature)
-       - Categorical features: each feature -> nn.Embedding of d_model
-    2. Prepend a learnable [CLS] token
-    3. Transformer encoder (n_layers of MultiHeadAttention + FFN)
-    4. Output: [CLS] token representation = embedding
-    5. Task head: Linear(d_model, output_dim) on top of [CLS]
+    1. Categorical features:
+       - Per-column nn.Embedding(n_categories, d_model)
+       - Optional: add learned column-type embedding (to distinguish
+         which column each token came from)
+       - Pass through Transformer encoder (multi-head self-attention
+         across categorical feature tokens)
+       - Flatten transformer output: (n_cat_columns * d_model,)
+    2. Numeric features:
+       - Column-wise LayerNorm
+       - Passed through directly (no transformer)
+    3. Concatenate flattened categorical representations + numeric
+    4. MLP head: sequence of [Linear -> ReLU -> Dropout] layers
+    5. Output head: Linear -> task output (for training)
+    6. Embedding extraction: penultimate MLP layer output
 
     Parameters
     ----------
     n_numeric : int
     n_categories_per_column : list[int]
+        Vocabulary size per categorical column.
     d_model : int
+        Dimension for categorical embeddings / transformer width.
     n_heads : int
-    n_layers : int
+    n_transformer_layers : int
     attn_dropout : float
-    ff_dropout : float
+    mlp_hidden_dims : list[int]
+        Width of each MLP layer after concatenation.
+    mlp_dropout : float
     task : str
+        "binary", "multiclass", "regression"
     n_classes : int or None
     """
 
     def forward(self, x_numeric, x_categorical):
-        """Full forward pass for training."""
+        """Full forward pass (for training). Returns task output."""
 
     def encode(self, x_numeric, x_categorical):
-        """Return [CLS] token embedding."""
+        """Forward pass up to penultimate MLP layer. Returns embedding."""
 
 
-class FTTransformerEmbeddingModel(EmbeddingModel):
-    """EmbeddingModel wrapper around FTTransformer.
+class TabTransformerEmbeddingModel(EmbeddingModel):
+    """EmbeddingModel wrapper around TabTransformer.
 
     Same training loop pattern as MLPEmbeddingModel: AdamW, early
-    stopping, batch encoding. The embedding_dim equals d_model.
+    stopping, batch encoding. The embedding_dim equals the last
+    MLP hidden dimension.
 
     Config keys:
-        d_model: int (64-512)
-        n_heads: int (4-16)
-        n_layers: int (2-6)
+        d_model: int (64-256)
+        n_heads: int (4-8)
+        n_transformer_layers: int (2-6)
         attn_dropout: float (0-0.3)
-        ff_dropout: float (0-0.5)
+        mlp_hidden_dims: list[int] (derived from mlp_depth + mlp_width)
+        mlp_dropout: float (0-0.5)
         lr: float
         weight_decay: float
         batch_size: int
@@ -1287,40 +1300,49 @@ class FTTransformerEmbeddingModel(EmbeddingModel):
 
 **Key implementation details**:
 
-- Feature tokenization: each numeric feature gets its own
-  `nn.Linear(1, d_model)`. Each categorical feature gets its own
+- Categorical embeddings: each categorical column gets its own
   `nn.Embedding(n_categories, d_model)`.
-- CLS token: a learnable `nn.Parameter(1, d_model)`, prepended to
-  the token sequence.
+- Column embedding (optional but recommended): a learnable
+  `nn.Embedding(n_cat_columns, d_model)` added to each categorical
+  token to provide positional/column identity information.
 - Transformer: use `nn.TransformerEncoderLayer` and
   `nn.TransformerEncoder` from PyTorch. Set `batch_first=True`.
-- FFN dimension: 4 * d_model (standard transformer ratio).
-- The embedding is the CLS token output from the last transformer
-  layer.
-- Constraint: d_model must be divisible by n_heads. The HPO space
-  must enforce this.
+  Attention operates across categorical feature tokens only (not
+  numeric features).
+- FFN dimension in transformer: 4 * d_model.
+- Numeric pathway: apply `nn.LayerNorm(n_numeric)` to the numeric
+  vector. Pass through without transformer attention.
+- Concatenation: flatten transformer output
+  (batch, n_cat_columns * d_model) and concatenate with normalized
+  numerics (batch, n_numeric) to get (batch, n_cat * d_model + n_num).
+- MLP head on the concatenated vector. Embedding = penultimate layer.
+- Constraint: d_model must be divisible by n_heads.
+- When there are no categorical features, the transformer is skipped
+  and the model reduces to a simple MLP on numerics.
+- When there are no numeric features, only the transformer output
+  is fed to the MLP head.
 
-**Testing requirements** (`tests/embed/test_scratch_fttransformer.py`):
+**Testing requirements** (`tests/embed/test_scratch_tabtransformer.py`):
 
 Same synthetic data as MLP tests.
 
-- `test_fttransformer_forward_shape`: forward pass, assert output
+- `test_tabtransformer_forward_shape`: forward pass, assert output
   shape.
-- `test_fttransformer_encode_shape`: .encode() returns
-  (batch_size, d_model).
-- `test_fttransformer_model_fit`: fit with small config (2 layers,
-  64 d_model, 3 epochs). No errors.
-- `test_fttransformer_model_encode`: after fit, encode returns
+- `test_tabtransformer_encode_shape`: .encode() returns
+  (batch_size, last_mlp_hidden_dim).
+- `test_tabtransformer_model_fit`: fit with small config (2
+  transformer layers, 64 d_model, 3 epochs). No errors.
+- `test_tabtransformer_model_encode`: after fit, encode returns
   correct shape numpy array with no NaN.
-- `test_fttransformer_model_encode_deterministic`: same input -> same
-  output.
-- `test_fttransformer_save_load_roundtrip`: save, load, same
+- `test_tabtransformer_model_encode_deterministic`: same input ->
+  same output.
+- `test_tabtransformer_save_load_roundtrip`: save, load, same
   embeddings.
-- `test_fttransformer_numeric_only`: dataset with no categoricals.
+- `test_tabtransformer_numeric_only`: dataset with no categoricals.
+  Assert works (falls back to MLP-only).
+- `test_tabtransformer_categorical_only`: dataset with no numerics.
   Assert works.
-- `test_fttransformer_categorical_only`: dataset with no numerics.
-  Assert works.
-- `test_fttransformer_regression`: regression task. Assert valid
+- `test_tabtransformer_regression`: regression task. Assert valid
   output.
 
 ---
@@ -1470,7 +1492,7 @@ Tests:
 
 **Dependencies**: T01, T03
 **Spec reference**: Section 8.4 (MLP space), Section 8.5
-(FT-Transformer space), Section 9.3 (Classical space)
+(TabTransformer space), Section 9.3 (Classical space)
 
 **Objective**: Implement `hybrid_embed/hpo/spaces.py` with all
 Hyperopt search space definitions.
@@ -1499,17 +1521,19 @@ def get_mlp_search_space() -> dict:
         batch_size: hp.choice([256, 512, 1024, 2048])
     """
 
-def get_fttransformer_search_space() -> dict:
-    """Return Hyperopt search space for FT-Transformer.
+def get_tabtransformer_search_space() -> dict:
+    """Return Hyperopt search space for TabTransformer.
 
     Keys:
-        d_model: hp.choice([64, 128, 192, 256, 384, 512])
-        n_heads: hp.choice([4, 8, 16])
+        d_model: hp.choice([64, 128, 192, 256])
+        n_heads: hp.choice([4, 8])
         -- constraint: d_model % n_heads == 0 enforced in
            objective function (invalid combos penalized)
-        n_layers: hp.quniform(2, 6, 1) -> cast to int
+        n_transformer_layers: hp.quniform(2, 6, 1) -> cast to int
         attn_dropout: hp.uniform(0, 0.3)
-        ff_dropout: hp.uniform(0, 0.5)
+        mlp_depth: hp.quniform(1, 4, 1) -> cast to int
+        mlp_width: hp.quniform(128, 1024, 64) -> cast to int
+        mlp_dropout: hp.uniform(0, 0.5)
         lr: hp.loguniform(ln(1e-5), ln(1e-3))
         weight_decay: hp.loguniform(ln(1e-6), ln(1e-2))
         batch_size: hp.choice([128, 256, 512])
@@ -1539,10 +1563,11 @@ def postprocess_mlp_params(params: dict) -> dict:
     - Resolve hp.choice indices to actual values
     """
 
-def postprocess_fttransformer_params(params: dict) -> dict:
+def postprocess_tabtransformer_params(params: dict) -> dict:
     """Convert Hyperopt sample to clean config dict.
 
     - Cast values to correct types
+    - Derive mlp_hidden_dims from mlp_depth and mlp_width
     - Validate d_model % n_heads == 0
     """
 
@@ -1557,7 +1582,7 @@ def postprocess_classical_params(params: dict) -> tuple[str, dict]:
 
 - `test_mlp_space_sample`: sample 10 configs, assert all have
   required keys with values in valid ranges.
-- `test_fttransformer_space_sample`: sample 10 configs, assert
+- `test_tabtransformer_space_sample`: sample 10 configs, assert
   required keys and valid ranges.
 - `test_classical_space_sample_classification`: sample 10, assert
   each has a model_name key.
@@ -1565,8 +1590,8 @@ def postprocess_classical_params(params: dict) -> tuple[str, dict]:
   has a model_name key.
 - `test_postprocess_mlp_params`: sample, postprocess, assert
   hidden_dims is a list[int] of correct length.
-- `test_postprocess_fttransformer_valid`: sample with valid d_model/
-  n_heads combo. Assert no error.
+- `test_postprocess_tabtransformer_valid`: sample with valid d_model/
+  n_heads combo. Assert no error and mlp_hidden_dims is derived.
 - `test_postprocess_classical_params`: sample, postprocess, assert
   returns (str, dict).
 
@@ -1596,7 +1621,7 @@ def hyperopt_search_embedding(
     n_numeric: int,
     n_categories_per_column: list[int],
     n_classes: int | None,
-    embedding_model_type: str,  # "mlp" or "fttransformer"
+    embedding_model_type: str,  # "mlp" or "tabtransformer"
     proxy_model: str = "linear",
     max_trials: int = 50,
     max_epochs: int = 50,
@@ -1928,7 +1953,7 @@ Arguments:
     automatically.
 --n-folds: int (default 5)
 --embed-models: str (default "mlp")
-    Comma-separated: "mlp", "fttransformer", "mlp,fttransformer"
+    Comma-separated: "mlp", "tabtransformer", "mlp,tabtransformer"
 --embed-trials: int (default 50)
 --embed-max-epochs: int (default 50)
 --classical-trials: int (default 150)
@@ -2041,10 +2066,10 @@ def test_end_to_end_regression():
     """
 
 @pytest.mark.slow
-def test_end_to_end_fttransformer():
-    """Full pipeline using FT-Transformer as embedding model.
+def test_end_to_end_tabtransformer():
+    """Full pipeline using TabTransformer as embedding model.
 
-    Same as binary test but with embedding_models=["fttransformer"].
+    Same as binary test but with embedding_models=["tabtransformer"].
     Budget: 2 embed trials, 3 epochs, 3 classical trials, 2 folds.
 
     Asserts:
@@ -2089,7 +2114,7 @@ def test_embeddings_only_constraint():
 | T09 | Local logger                   | 2     | T01, T03                | Small            |
 | T10 | Embedding base class           | 3     | T01, T03, T02           | Small            |
 | T11 | MLP embedding model            | 3     | T10, T02, T07           | Large            |
-| T12 | FT-Transformer model           | 3     | T10, T02, T07           | Large            |
+| T12 | TabTransformer model           | 3     | T10, T02, T07           | Large            |
 | T13 | Classical model zoo            | 4     | T01, T03                | Medium           |
 | T14 | HPO search spaces              | 5     | T01, T03                | Small            |
 | T15 | Embedding HPO search           | 5     | T10-T12, T14, T08, T09 | Medium           |

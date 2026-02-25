@@ -178,18 +178,20 @@ Implement at least:
    * Concatenate -> MLP trunk
    * Output embedding vector from penultimate layer
 
-2. **FT-Transformer-style model** (required for thesis benchmarking)
+2. **TabTransformer** (Huang et al., 2020) (required for thesis benchmarking)
 
-   * Feature tokenization (numeric as learned linear token; categorical
-     as embedding token)
-   * Transformer encoder
-   * CLS pooled output = embedding
+   * Categorical features -> per-column embeddings -> Transformer encoder
+     (multi-head self-attention across categorical tokens)
+   * Numeric features -> column-wise normalization, passed through directly
+   * Concatenate transformed categorical representations + numeric features
+   * MLP head on concatenated vector
+   * Embedding extraction: penultimate layer output (before task head)
 
 Both must be implemented in native PyTorch.
 
 #### Mode B -- Pre-existing PyTorch tabular frameworks (optional, deferred)
 
-Adapters for external libraries (pytorch-tabular, rtdl, TabNet) are
+Adapters for external libraries (pytorch-tabular, TabNet) are
 deferred to avoid scope creep. The adapter interface is defined so they
 can be added later without refactoring.
 
@@ -268,13 +270,14 @@ Hyperopt should tune:
 * batch_size: categorical choices (256, 512, 1024, 2048)
 * optimizer: AdamW (fixed)
 
-### 8.5 Search space: FT-Transformer
+### 8.5 Search space: TabTransformer
 
-* n_layers: 2--6
-* d_model: 64--512
-* n_heads: 4--16 (constrained so d_model % n_heads == 0)
+* n_transformer_layers: 2--6
+* d_model: 64--256 (categorical embedding dimension / transformer width)
+* n_heads: 4--8 (constrained so d_model % n_heads == 0)
 * attn_dropout: 0--0.3
-* ff_dropout: 0--0.5
+* mlp_hidden_dims: derived from depth (1--4) and width (128--1024)
+* mlp_dropout: 0--0.5
 * lr: log-uniform (1e-5 to 1e-3)
 * weight_decay: log-uniform (1e-6 to 1e-2)
 * batch_size: categorical choices (128, 256, 512)
@@ -515,7 +518,7 @@ hybrid_embed/
     __init__.py
     base.py                        # EmbeddingModel ABC
     scratch_mlp.py                 # from-scratch MLP
-    scratch_fttransformer.py       # from-scratch FT-Transformer
+    scratch_tabtransformer.py      # from-scratch TabTransformer
     adapters/                      # deferred; interface defined in base.py
       __init__.py
 
@@ -677,7 +680,7 @@ Framework is complete when:
 
 2. **Implements**:
    * From-scratch MLP embedding + Hyperopt search
-   * From-scratch FT-Transformer embedding + Hyperopt search
+   * From-scratch TabTransformer embedding + Hyperopt search
    * Classical model Hyperopt tuning on embeddings
    * Full K-fold CV evaluation pipeline
 
