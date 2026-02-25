@@ -111,8 +111,8 @@ package is installable and importable.
    - Project name: `hybrid_embed`
    - python >= 3.10
    - Dependencies (do NOT pin exact versions, use >= with minimum):
-     numpy, pandas, scikit-learn, scipy, pyyaml, torch, lightgbm,
-     xgboost, catboost, hyperopt, joblib
+     numpy, pandas, scikit-learn, scipy, pyyaml, torch,
+     pytorch-tabular, lightgbm, xgboost, catboost, hyperopt, joblib
    - Dev dependencies (optional group "dev"): pytest
    - Optional dependencies group "benchmarks": openml
 
@@ -1216,134 +1216,148 @@ Tests:
 
 ---
 
-### TASK T12: TabTransformer Embedding Model
+### TASK T12: pytorch-tabular Adapter (Mode B)
 
 **Dependencies**: T10, T02, T07
-**Spec reference**: Section 7.3 Mode A item 2, Section 8.5
+**Spec reference**: Section 7.3 Mode B, Section 8.5
 
-**Objective**: Implement `hybrid_embed/embed/scratch_tabtransformer.py`
--- a TabTransformer model (Huang et al., 2020) for tabular data.
+**Objective**: Implement `hybrid_embed/embed/adapters/pytorch_tabular_adapter.py`
+-- an adapter that wraps `pytorch-tabular` library models behind the
+framework's `EmbeddingModel` interface. This gives access to established
+architectures like TabTransformer, TabNet, GATE, etc.
 
 **Deliverables**:
-- `hybrid_embed/embed/scratch_tabtransformer.py`
-- `tests/embed/test_scratch_tabtransformer.py`
+- `hybrid_embed/embed/adapters/pytorch_tabular_adapter.py`
+- `tests/embed/test_pytorch_tabular_adapter.py`
 
 **Detailed requirements**:
 
 ```
-class TabTransformer(nn.Module):
-    """TabTransformer for tabular data (Huang et al., 2020).
+class PytorchTabularEmbeddingModel(EmbeddingModel):
+    """Adapter wrapping pytorch-tabular models as EmbeddingModel.
 
-    Architecture:
-    1. Categorical features:
-       - Per-column nn.Embedding(n_categories, d_model)
-       - Optional: add learned column-type embedding (to distinguish
-         which column each token came from)
-       - Pass through Transformer encoder (multi-head self-attention
-         across categorical feature tokens)
-       - Flatten transformer output: (n_cat_columns * d_model,)
-    2. Numeric features:
-       - Column-wise LayerNorm
-       - Passed through directly (no transformer)
-    3. Concatenate flattened categorical representations + numeric
-    4. MLP head: sequence of [Linear -> ReLU -> Dropout] layers
-    5. Output head: Linear -> task output (for training)
-    6. Embedding extraction: penultimate MLP layer output
+    This adapter translates between the hybrid_embed interface
+    (preprocessed dict inputs) and pytorch-tabular's expected
+    DataFrame + config interface. It handles:
+
+    1. Converting preprocessed data back to DataFrame format
+       (pytorch-tabular expects DataFrames)
+    2. Building the pytorch-tabular model config from the HPO
+       params dict
+    3. Training via pytorch-tabular's Trainer
+    4. Extracting embeddings from the model's backbone
+       (penultimate layer output)
 
     Parameters
     ----------
-    n_numeric : int
-    n_categories_per_column : list[int]
-        Vocabulary size per categorical column.
-    d_model : int
-        Dimension for categorical embeddings / transformer width.
-    n_heads : int
-    n_transformer_layers : int
-    attn_dropout : float
-    mlp_hidden_dims : list[int]
-        Width of each MLP layer after concatenation.
-    mlp_dropout : float
-    task : str
-        "binary", "multiclass", "regression"
-    n_classes : int or None
-    """
+    model_type : str
+        Which pytorch-tabular model to use. Supported:
+        - "tab_transformer" (TabTransformer, Huang et al. 2020)
+        - "category_embedding" (CategoryEmbeddingModel)
+        - "tabnet" (TabNet, Arik & Pfister 2019)
+        - "gate" (GATE, Badirli et al. 2020)
+        Additional models can be added by extending the
+        _MODEL_CONFIG_MAP.
 
-    def forward(self, x_numeric, x_categorical):
-        """Full forward pass (for training). Returns task output."""
+    schema : Schema
+        Column type information.
 
-    def encode(self, x_numeric, x_categorical):
-        """Forward pass up to penultimate MLP layer. Returns embedding."""
-
-
-class TabTransformerEmbeddingModel(EmbeddingModel):
-    """EmbeddingModel wrapper around TabTransformer.
-
-    Same training loop pattern as MLPEmbeddingModel: AdamW, early
-    stopping, batch encoding. The embedding_dim equals the last
-    MLP hidden dimension.
-
-    Config keys:
-        d_model: int (64-256)
-        n_heads: int (4-8)
-        n_transformer_layers: int (2-6)
-        attn_dropout: float (0-0.3)
-        mlp_hidden_dims: list[int] (derived from mlp_depth + mlp_width)
-        mlp_dropout: float (0-0.5)
+    Config keys (common to all models):
+        model_type: str
         lr: float
         weight_decay: float
         batch_size: int
         max_epochs: int
         patience: int
-        device: str
+        device: str (mapped to pytorch-tabular trainer args)
+
+    Config keys (TabTransformer-specific):
+        input_embed_dim: int (32-128)
+        num_heads: int (2-8)
+        num_attn_blocks: int (2-6)
+        attn_dropout: float (0-0.3)
+        add_shared_embedding: bool
+        shared_embedding_fraction: float (if shared embedding on)
+
+    Config keys (other models):
+        Model-specific params mapped to the corresponding
+        pytorch-tabular model config class.
     """
+
+    def __init__(self, model_type: str, schema):
+        ...
+
+    def fit(self, X_train, y_train, X_val, y_val, config):
+        """Train via pytorch-tabular.
+
+        Steps:
+        1. Convert preprocessed dicts to DataFrames
+        2. Build DataConfig, ModelConfig, TrainerConfig,
+           OptimizerConfig from the config dict
+        3. Instantiate TabularModel
+        4. Call tabular_model.fit(train=train_df, validation=val_df)
+        5. Store the trained model for later encoding
+        """
+
+    def encode(self, X):
+        """Extract embeddings from the trained model's backbone.
+
+        Uses pytorch-tabular's model to get the backbone output
+        (before the final prediction head). This is the
+        penultimate-layer representation.
+
+        Returns numpy array of shape (n_samples, embedding_dim).
+        """
+
+    def save(self, path):
+        """Save using pytorch-tabular's save_model method."""
+
+    @classmethod
+    def load(cls, path):
+        """Load using pytorch-tabular's load_model method."""
 ```
 
 **Key implementation details**:
 
-- Categorical embeddings: each categorical column gets its own
-  `nn.Embedding(n_categories, d_model)`.
-- Column embedding (optional but recommended): a learnable
-  `nn.Embedding(n_cat_columns, d_model)` added to each categorical
-  token to provide positional/column identity information.
-- Transformer: use `nn.TransformerEncoderLayer` and
-  `nn.TransformerEncoder` from PyTorch. Set `batch_first=True`.
-  Attention operates across categorical feature tokens only (not
-  numeric features).
-- FFN dimension in transformer: 4 * d_model.
-- Numeric pathway: apply `nn.LayerNorm(n_numeric)` to the numeric
-  vector. Pass through without transformer attention.
-- Concatenation: flatten transformer output
-  (batch, n_cat_columns * d_model) and concatenate with normalized
-  numerics (batch, n_numeric) to get (batch, n_cat * d_model + n_num).
-- MLP head on the concatenated vector. Embedding = penultimate layer.
-- Constraint: d_model must be divisible by n_heads.
-- When there are no categorical features, the transformer is skipped
-  and the model reduces to a simple MLP on numerics.
-- When there are no numeric features, only the transformer output
-  is fed to the MLP head.
+- Data conversion: pytorch-tabular expects pandas DataFrames with
+  column names. The adapter must reconstruct DataFrames from the
+  preprocessed dict format. Store column names from schema.
+- Target column: pytorch-tabular needs the target in the DataFrame.
+  The adapter must add y as a column.
+- Embedding extraction: pytorch-tabular models have a `backbone`
+  attribute (or similar) that exposes the representation before the
+  output head. Use a forward hook or the model's built-in method
+  to extract these representations.
+- Model config mapping: maintain a dict that maps model_type strings
+  to their pytorch-tabular config classes (TabTransformerConfig,
+  CategoryEmbeddingModelConfig, etc.).
+- Early stopping: configure via pytorch-tabular's TrainerConfig
+  (it uses PyTorch Lightning under the hood).
+- Device handling: pytorch-tabular manages devices via its trainer.
+  Pass the device preference through TrainerConfig.
 
-**Testing requirements** (`tests/embed/test_scratch_tabtransformer.py`):
+**Testing requirements** (`tests/embed/test_pytorch_tabular_adapter.py`):
 
-Same synthetic data as MLP tests.
+Generate synthetic data: 200 samples, 5 numeric features, 3
+categorical features. Binary classification target.
 
-- `test_tabtransformer_forward_shape`: forward pass, assert output
-  shape.
-- `test_tabtransformer_encode_shape`: .encode() returns
-  (batch_size, last_mlp_hidden_dim).
-- `test_tabtransformer_model_fit`: fit with small config (2
-  transformer layers, 64 d_model, 3 epochs). No errors.
-- `test_tabtransformer_model_encode`: after fit, encode returns
-  correct shape numpy array with no NaN.
-- `test_tabtransformer_model_encode_deterministic`: same input ->
-  same output.
-- `test_tabtransformer_save_load_roundtrip`: save, load, same
-  embeddings.
-- `test_tabtransformer_numeric_only`: dataset with no categoricals.
-  Assert works (falls back to MLP-only).
-- `test_tabtransformer_categorical_only`: dataset with no numerics.
-  Assert works.
-- `test_tabtransformer_regression`: regression task. Assert valid
-  output.
+- `test_adapter_fit_tab_transformer`: fit with model_type=
+  "tab_transformer", small config (2 blocks, 32 embed dim,
+  3 epochs). Assert no errors. Assert embedding_dim is set.
+- `test_adapter_encode_shape`: after fit, encode returns numpy
+  array of correct shape (n_samples, embedding_dim). No NaN.
+- `test_adapter_encode_deterministic`: encode same data twice,
+  assert identical results.
+- `test_adapter_save_load_roundtrip`: fit, save, load, encode.
+  Assert same embeddings (within tolerance).
+- `test_adapter_category_embedding_model`: fit with model_type=
+  "category_embedding". Assert works and produces valid embeddings.
+- `test_adapter_regression_task`: fit on regression data. Assert
+  valid embeddings.
+- `test_adapter_multiclass_task`: fit on multiclass data (4 classes).
+  Assert valid embeddings.
+- `test_adapter_unknown_model_type`: pass invalid model_type,
+  assert ValueError raised.
 
 ---
 ---
@@ -1521,22 +1535,34 @@ def get_mlp_search_space() -> dict:
         batch_size: hp.choice([256, 512, 1024, 2048])
     """
 
-def get_tabtransformer_search_space() -> dict:
-    """Return Hyperopt search space for TabTransformer.
+def get_pytorch_tabular_search_space(model_type: str) -> dict:
+    """Return Hyperopt search space for a pytorch-tabular model.
 
-    Keys:
-        d_model: hp.choice([64, 128, 192, 256])
-        n_heads: hp.choice([4, 8])
-        -- constraint: d_model % n_heads == 0 enforced in
-           objective function (invalid combos penalized)
-        n_transformer_layers: hp.quniform(2, 6, 1) -> cast to int
+    Parameters
+    ----------
+    model_type : str
+        "tab_transformer", "category_embedding", "tabnet", "gate"
+
+    Returns a Hyperopt space dict with model-specific keys.
+
+    TabTransformer keys:
+        input_embed_dim: hp.choice([32, 64, 128])
+        num_heads: hp.choice([2, 4, 8])
+        num_attn_blocks: hp.quniform(2, 6, 1) -> int
         attn_dropout: hp.uniform(0, 0.3)
-        mlp_depth: hp.quniform(1, 4, 1) -> cast to int
-        mlp_width: hp.quniform(128, 1024, 64) -> cast to int
-        mlp_dropout: hp.uniform(0, 0.5)
+        add_shared_embedding: hp.choice([True, False])
+        shared_embedding_fraction: hp.uniform(0.25, 0.75)
         lr: hp.loguniform(ln(1e-5), ln(1e-3))
         weight_decay: hp.loguniform(ln(1e-6), ln(1e-2))
         batch_size: hp.choice([128, 256, 512])
+
+    CategoryEmbedding keys:
+        layers: derived from depth + width
+        dropout: hp.uniform(0, 0.5)
+        activation: hp.choice(["ReLU", "GELU", "SiLU"])
+        lr, weight_decay, batch_size (same ranges)
+
+    Additional model types follow similar patterns.
     """
 
 def get_classical_search_space(task: str) -> dict:
@@ -1563,12 +1589,14 @@ def postprocess_mlp_params(params: dict) -> dict:
     - Resolve hp.choice indices to actual values
     """
 
-def postprocess_tabtransformer_params(params: dict) -> dict:
-    """Convert Hyperopt sample to clean config dict.
+def postprocess_pytorch_tabular_params(
+    params: dict, model_type: str
+) -> dict:
+    """Convert Hyperopt sample to clean config dict for pytorch-tabular.
 
     - Cast values to correct types
-    - Derive mlp_hidden_dims from mlp_depth and mlp_width
-    - Validate d_model % n_heads == 0
+    - Validate constraints (e.g., embed_dim % num_heads == 0)
+    - Add model_type to the returned dict
     """
 
 def postprocess_classical_params(params: dict) -> tuple[str, dict]:
@@ -1582,16 +1610,18 @@ def postprocess_classical_params(params: dict) -> tuple[str, dict]:
 
 - `test_mlp_space_sample`: sample 10 configs, assert all have
   required keys with values in valid ranges.
-- `test_tabtransformer_space_sample`: sample 10 configs, assert
-  required keys and valid ranges.
+- `test_pytorch_tabular_space_sample_tab_transformer`: sample 10
+  configs for "tab_transformer", assert required keys and valid ranges.
+- `test_pytorch_tabular_space_sample_category_embedding`: sample 10
+  configs for "category_embedding", assert required keys.
 - `test_classical_space_sample_classification`: sample 10, assert
   each has a model_name key.
 - `test_classical_space_sample_regression`: sample 10, assert each
   has a model_name key.
 - `test_postprocess_mlp_params`: sample, postprocess, assert
   hidden_dims is a list[int] of correct length.
-- `test_postprocess_tabtransformer_valid`: sample with valid d_model/
-  n_heads combo. Assert no error and mlp_hidden_dims is derived.
+- `test_postprocess_pytorch_tabular_valid`: sample, postprocess for
+  "tab_transformer". Assert no error and model_type is in result.
 - `test_postprocess_classical_params`: sample, postprocess, assert
   returns (str, dict).
 
@@ -1621,7 +1651,7 @@ def hyperopt_search_embedding(
     n_numeric: int,
     n_categories_per_column: list[int],
     n_classes: int | None,
-    embedding_model_type: str,  # "mlp" or "tabtransformer"
+    embedding_model_type: str,  # "mlp" or "tab_transformer" (or other pytorch-tabular model)
     proxy_model: str = "linear",
     max_trials: int = 50,
     max_epochs: int = 50,
@@ -1953,7 +1983,7 @@ Arguments:
     automatically.
 --n-folds: int (default 5)
 --embed-models: str (default "mlp")
-    Comma-separated: "mlp", "tabtransformer", "mlp,tabtransformer"
+    Comma-separated: "mlp", "tab_transformer", "mlp,tab_transformer"
 --embed-trials: int (default 50)
 --embed-max-epochs: int (default 50)
 --classical-trials: int (default 150)
@@ -2066,10 +2096,10 @@ def test_end_to_end_regression():
     """
 
 @pytest.mark.slow
-def test_end_to_end_tabtransformer():
-    """Full pipeline using TabTransformer as embedding model.
+def test_end_to_end_tab_transformer():
+    """Full pipeline using TabTransformer via pytorch-tabular adapter.
 
-    Same as binary test but with embedding_models=["tabtransformer"].
+    Same as binary test but with embedding_models=["tab_transformer"].
     Budget: 2 embed trials, 3 epochs, 3 classical trials, 2 folds.
 
     Asserts:
@@ -2114,7 +2144,7 @@ def test_embeddings_only_constraint():
 | T09 | Local logger                   | 2     | T01, T03                | Small            |
 | T10 | Embedding base class           | 3     | T01, T03, T02           | Small            |
 | T11 | MLP embedding model            | 3     | T10, T02, T07           | Large            |
-| T12 | TabTransformer model           | 3     | T10, T02, T07           | Large            |
+| T12 | pytorch-tabular adapter        | 3     | T10, T02, T07           | Medium           |
 | T13 | Classical model zoo            | 4     | T01, T03                | Medium           |
 | T14 | HPO search spaces              | 5     | T01, T03                | Small            |
 | T15 | Embedding HPO search           | 5     | T10-T12, T14, T08, T09 | Medium           |

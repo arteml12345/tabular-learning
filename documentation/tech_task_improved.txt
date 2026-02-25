@@ -167,9 +167,12 @@ Embedding stage must output a **fixed-length dense vector** per sample:
 
 ### 7.3 Embedding Sources
 
-#### Mode A -- From-scratch PyTorch architectures (required)
+#### Mode A -- From-scratch PyTorch architectures
 
-Implement at least:
+Custom architectures written in raw PyTorch (`nn.Module`). These are
+simple, user-defined networks where the developer controls every layer.
+
+Required:
 
 1. **Tabular MLP with categorical embeddings**
 
@@ -178,28 +181,36 @@ Implement at least:
    * Concatenate -> MLP trunk
    * Output embedding vector from penultimate layer
 
-2. **TabTransformer** (Huang et al., 2020) (required for thesis benchmarking)
+Mode A is for "improvised" architectures -- straightforward models
+where you define the structure directly in PyTorch.
 
-   * Categorical features -> per-column embeddings -> Transformer encoder
-     (multi-head self-attention across categorical tokens)
-   * Numeric features -> column-wise normalization, passed through directly
-   * Concatenate transformed categorical representations + numeric features
-   * MLP head on concatenated vector
-   * Embedding extraction: penultimate layer output (before task head)
+#### Mode B -- Library-backed architectures (pytorch-tabular) (required)
 
-Both must be implemented in native PyTorch.
+For established, published architectures with existing implementations,
+use the `pytorch-tabular` library. Instead of reimplementing these
+models, write an adapter that wraps `pytorch-tabular` behind the
+framework's `EmbeddingModel` interface.
 
-#### Mode B -- Pre-existing PyTorch tabular frameworks (optional, deferred)
+`pytorch-tabular` is a **core dependency** of this project.
 
-Adapters for external libraries (pytorch-tabular, TabNet) are
-deferred to avoid scope creep. The adapter interface is defined so they
-can be added later without refactoring.
+Models available through this adapter (non-exhaustive):
 
-**Adapter interface**: All library models must expose:
+* **TabTransformer** (Huang et al., 2020) -- required for benchmarking
+* **TabNet** (Arik & Pfister, 2019)
+* **GATE** (Badirli et al., 2020)
+* **DANet**, **CategoryEmbedding**, and others
+
+The adapter selects the model type via a config string and delegates
+training, inference, and embedding extraction to `pytorch-tabular`.
+
+**Adapter interface**: The adapter must expose:
 
 * `fit(X_train, y_train, X_val, y_val, config)`
 * `encode(X) -> np.ndarray`
 * `save(path)` / `load(path)`
+
+Embedding extraction: use `pytorch-tabular`'s backbone to obtain
+the penultimate-layer representation as the embedding vector.
 
 ---
 
@@ -270,17 +281,25 @@ Hyperopt should tune:
 * batch_size: categorical choices (256, 512, 1024, 2048)
 * optimizer: AdamW (fixed)
 
-### 8.5 Search space: TabTransformer
+### 8.5 Search space: pytorch-tabular models (Mode B)
 
-* n_transformer_layers: 2--6
-* d_model: 64--256 (categorical embedding dimension / transformer width)
-* n_heads: 4--8 (constrained so d_model % n_heads == 0)
+The search space depends on the selected pytorch-tabular model type.
+Hyperopt selects both the model type and its hyperparameters.
+
+**TabTransformer** (primary):
+
+* input_embed_dim: 32--128
+* num_heads: 2--8 (constrained so input_embed_dim % num_heads == 0)
+* num_attn_blocks: 2--6
 * attn_dropout: 0--0.3
-* mlp_hidden_dims: derived from depth (1--4) and width (128--1024)
-* mlp_dropout: 0--0.5
+* add_shared_embedding: True / False
+* shared_embedding_fraction: 0.25--0.75 (if shared embedding on)
 * lr: log-uniform (1e-5 to 1e-3)
 * weight_decay: log-uniform (1e-6 to 1e-2)
 * batch_size: categorical choices (128, 256, 512)
+
+Additional pytorch-tabular models may define their own sub-spaces
+within the same Hyperopt `hp.choice` structure.
 
 ---
 
@@ -477,6 +496,7 @@ Must be sufficient for thesis tables and analysis.
 ### 13.2 Deep learning
 
 * torch
+* pytorch-tabular (Mode B embedding models: TabTransformer, etc.)
 
 ### 13.3 Classical models
 
@@ -517,10 +537,10 @@ hybrid_embed/
   embed/
     __init__.py
     base.py                        # EmbeddingModel ABC
-    scratch_mlp.py                 # from-scratch MLP
-    scratch_tabtransformer.py      # from-scratch TabTransformer
-    adapters/                      # deferred; interface defined in base.py
+    scratch_mlp.py                 # Mode A: from-scratch MLP
+    adapters/
       __init__.py
+      pytorch_tabular_adapter.py   # Mode B: pytorch-tabular wrapper
 
   classical/
     __init__.py
@@ -679,8 +699,9 @@ Framework is complete when:
    * California Housing (regression)
 
 2. **Implements**:
-   * From-scratch MLP embedding + Hyperopt search
-   * From-scratch TabTransformer embedding + Hyperopt search
+   * Mode A: from-scratch MLP embedding + Hyperopt search
+   * Mode B: pytorch-tabular adapter (TabTransformer + at least one
+     other model) + Hyperopt search
    * Classical model Hyperopt tuning on embeddings
    * Full K-fold CV evaluation pipeline
 
