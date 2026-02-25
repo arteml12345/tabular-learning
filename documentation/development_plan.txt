@@ -338,11 +338,16 @@ class RunConfig:
         Categories with more unique values than this cap get
         rare values collapsed into __OOV__. Prevents huge
         embedding tables for high-cardinality columns.
+    val_fraction : float
+        Fraction of training data used as validation when running
+        in single-split mode (HybridTabularModel). Ignored in
+        K-fold mode where folds define the splits. Default 0.2.
     add_missing_indicator : bool
         When True, adds a binary column per feature indicating
         whether the original value was missing (before imputation).
     """
     n_folds: int = 5
+    val_fraction: float = 0.2
     master_seed: int = 42
     device: str = "auto"
     deterministic: bool = False
