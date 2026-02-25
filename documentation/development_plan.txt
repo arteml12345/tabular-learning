@@ -301,21 +301,63 @@ class ClassicalStepConfig:
 
 @dataclass
 class RunConfig:
+    """General experiment settings (not model-specific).
+
+    Parameters
+    ----------
+    n_folds : int
+        Number of cross-validation folds. HPO runs on fold-0,
+        then the best config is evaluated across all folds.
+    master_seed : int
+        Single seed from which all other seeds are derived
+        (per-fold, per-trial). Same value = reproducible results.
+    device : str
+        Where PyTorch models run. "auto" picks the best available
+        (CUDA GPU > Apple MPS > CPU). Can be forced to a specific
+        device: "cuda", "mps", or "cpu".
+    deterministic : bool
+        When True, enables PyTorch deterministic algorithms.
+        Bit-for-bit reproducible at the cost of slower training.
+    save_embeddings : bool
+        Whether to save extracted embedding vectors (numpy arrays)
+        to disk per fold. Off by default (can be large).
+    save_predictions : bool
+        Whether to save per-fold predictions to disk. Useful for
+        post-hoc analysis (confusion matrices, error analysis).
+    output_dir : str
+        Root directory for run artifacts. Each experiment creates
+        a subfolder with logs, metrics, and saved models.
+    dataset_id : str
+        Label used in artifact folder naming and logs. Purely
+        organizational (e.g. "adult", "california_housing").
+    scaler : str
+        Scaler for numeric features. "standard" = zero mean,
+        unit variance. "robust" = median-centered, IQR-scaled
+        (better for data with outliers).
+    max_categorical_cardinality : int
+        Categories with more unique values than this cap get
+        rare values collapsed into __OOV__. Prevents huge
+        embedding tables for high-cardinality columns.
+    proxy_model : str
+        Lightweight model used during embedding HPO to evaluate
+        embedding quality. "linear" = LogisticRegression / Ridge
+        (fast, stable). "lightgbm" = small LightGBM (better for
+        embeddings destined for tree-based final models, slower).
+    add_missing_indicator : bool
+        When True, adds a binary column per feature indicating
+        whether the original value was missing (before imputation).
+    """
     n_folds: int = 5
     master_seed: int = 42
-    device: str = "auto"          # "auto"|"cuda"|"mps"|"cpu"
+    device: str = "auto"
     deterministic: bool = False
     save_embeddings: bool = False
     save_predictions: bool = True
     output_dir: str = "runs"
     dataset_id: str = "default"
-    # Scaler choice
-    scaler: str = "standard"      # "standard" | "robust"
-    # Cardinality cap for categoricals
+    scaler: str = "standard"
     max_categorical_cardinality: int = 1000
-    # Proxy model for embedding HPO
-    proxy_model: str = "linear"   # "linear" | "lightgbm"
-    # Missingness indicator toggle
+    proxy_model: str = "linear"
     add_missing_indicator: bool = False
 
 @dataclass
