@@ -59,7 +59,8 @@ The framework must treat the tabular dataset as "raw" inputs and perform only:
 
 ## 2. Pipeline Overview
 
-**Input**: `X (DataFrame), y (Series/array), task_config, budget_config`
+**Input**: `X (DataFrame), y (Series/array), task_config, embedding_step,
+classical_step, budget_config`
 
 **Output**: `RunResult` + local artifacts folder
 
@@ -165,52 +166,75 @@ Embedding stage must output a **fixed-length dense vector** per sample:
 * All embedding training happens on the selected device
 * Encoding output is always returned as CPU numpy array (for classical models)
 
-### 7.3 Embedding Sources
+### 7.3 Embedding Model Selection (user's choice)
+
+The user selects ONE embedding model for each experiment run. The
+framework tunes its hyperparameters within the given search space.
+If the user wants to compare models, they run separate experiments.
 
 #### Mode A -- From-scratch PyTorch architectures
 
-Custom architectures written in raw PyTorch (`nn.Module`). These are
-simple, user-defined networks where the developer controls every layer.
+Custom architectures written in raw PyTorch (`nn.Module`).
 
-Required:
+The framework ships with one built-in from-scratch model:
 
-1. **Tabular MLP with categorical embeddings**
+1. **Tabular MLP with categorical embeddings** (`model_type="mlp"`)
 
    * Learn embedding tables per categorical feature
    * Numeric projection layer
    * Concatenate -> MLP trunk
    * Output embedding vector from penultimate layer
 
-Mode A is for "improvised" architectures -- straightforward models
-where you define the structure directly in PyTorch.
+Usage:
 
-#### Mode B -- Library-backed architectures (pytorch-tabular) (required)
+```python
+embedding = EmbeddingStepConfig(model_type="mlp")
+# or with custom HP space:
+embedding = EmbeddingStepConfig(
+    model_type="mlp",
+    search_space={
+        "hidden_dims": hp.choice("h", [[128, 64], [256, 128, 64]]),
+        "dropout": hp.uniform("d", 0, 0.3),
+        "lr": hp.loguniform("lr", ln(1e-4), ln(1e-2)),
+    },
+    fixed_params={"activation": "gelu", "use_layer_norm": True},
+)
+```
 
-For established, published architectures with existing implementations,
-use the `pytorch-tabular` library. Instead of reimplementing these
-models, write an adapter that wraps `pytorch-tabular` behind the
-framework's `EmbeddingModel` interface.
+#### Mode B -- Library-backed architectures (pytorch-tabular)
 
-`pytorch-tabular` is a **core dependency** of this project.
+For established, published architectures, use the `pytorch-tabular`
+library via the adapter. `pytorch-tabular` is a core dependency.
 
-Models available through this adapter (non-exhaustive):
+The user selects ONE specific pytorch-tabular model:
 
-* **TabTransformer** (Huang et al., 2020) -- required for benchmarking
-* **TabNet** (Arik & Pfister, 2019)
-* **GATE** (Badirli et al., 2020)
-* **DANet**, **CategoryEmbedding**, and others
+* **TabTransformer** (`model_type="tab_transformer"`)
+* **TabNet** (`model_type="tabnet"`)
+* **GATE** (`model_type="gate"`)
+* **CategoryEmbedding** (`model_type="category_embedding"`)
+* Others as supported by pytorch-tabular
 
-The adapter selects the model type via a config string and delegates
-training, inference, and embedding extraction to `pytorch-tabular`.
+Usage:
 
-**Adapter interface**: The adapter must expose:
+```python
+embedding = EmbeddingStepConfig(model_type="tab_transformer")
+# or with custom HP space:
+embedding = EmbeddingStepConfig(
+    model_type="tab_transformer",
+    search_space={
+        "input_embed_dim": hp.choice("d", [32, 64]),
+        "num_attn_blocks": hp.quniform("b", 2, 4, 1),
+    },
+)
+```
+
+#### Common interface
+
+Both Mode A and Mode B models implement `EmbeddingModel`:
 
 * `fit(X_train, y_train, X_val, y_val, config)`
 * `encode(X) -> np.ndarray`
 * `save(path)` / `load(path)`
-
-Embedding extraction: use `pytorch-tabular`'s backbone to obtain
-the penultimate-layer representation as the embedding vector.
 
 ---
 
@@ -266,11 +290,21 @@ Per trial:
   (n_estimators=100). This can better evaluate embeddings destined
   for tree-based final models, at the cost of slower proxy evaluation.
 
-### 8.4 Search space: From-scratch MLP
+### 8.4 Search spaces
 
-Hyperopt should tune:
+Each model type has a **default search space** defined in the
+framework. The user can override it partially or fully via
+`EmbeddingStepConfig.search_space` or
+`ClassicalStepConfig.search_space`.
 
-* embedding_dim (global): 32--256
+If `search_space=None` (default), the framework uses its built-in
+default space. If the user provides a search space, ONLY those
+parameters are tuned -- parameters not in the space use values from
+`fixed_params` or the model's defaults.
+
+#### Default MLP search space (Mode A)
+
+* embedding_dim: 32--256
 * MLP depth: 2--8 layers
 * hidden width: 128--2048
 * dropout: 0--0.5
@@ -281,25 +315,24 @@ Hyperopt should tune:
 * batch_size: categorical choices (256, 512, 1024, 2048)
 * optimizer: AdamW (fixed)
 
-### 8.5 Search space: pytorch-tabular models (Mode B)
-
-The search space depends on the selected pytorch-tabular model type.
-Hyperopt selects both the model type and its hyperparameters.
-
-**TabTransformer** (primary):
+#### Default TabTransformer search space (Mode B)
 
 * input_embed_dim: 32--128
-* num_heads: 2--8 (constrained so input_embed_dim % num_heads == 0)
+* num_heads: 2--8
 * num_attn_blocks: 2--6
 * attn_dropout: 0--0.3
 * add_shared_embedding: True / False
-* shared_embedding_fraction: 0.25--0.75 (if shared embedding on)
 * lr: log-uniform (1e-5 to 1e-3)
 * weight_decay: log-uniform (1e-6 to 1e-2)
 * batch_size: categorical choices (128, 256, 512)
 
-Additional pytorch-tabular models may define their own sub-spaces
-within the same Hyperopt `hp.choice` structure.
+Other pytorch-tabular models have their own default spaces.
+
+#### Default classical model search spaces
+
+Each built-in classical model has a default space. See
+`classical/model_zoo.py` for full definitions. User overrides
+replace the entire space for the selected model.
 
 ---
 
@@ -319,85 +352,73 @@ The embedding model is NOT retrained on train+val combined. The val set
 is used only for early stopping. This keeps the evaluation clean and
 avoids data leakage concerns.
 
-### 9.2 Allowed classical model families
+### 9.2 Classical model selection (user's choice)
 
-All consume embedding vectors `E` only.
+The user selects ONE classical model for each experiment run. The
+framework does not search across model families -- the user makes
+that research decision.
 
-**Classification**
+Any sklearn-compatible model can be used. The framework ships with
+default HP spaces for common models, but the user can provide any
+model class + HP space.
 
-* LogisticRegression
-* RandomForestClassifier
-* ExtraTreesClassifier
-* XGBoostClassifier
-* LightGBMClassifier
-* CatBoostClassifier
+**Built-in models with default HP spaces:**
 
-**Regression**
+Classification: LogisticRegression, RandomForestClassifier,
+ExtraTreesClassifier, XGBoostClassifier, LightGBMClassifier,
+CatBoostClassifier.
 
-* Ridge
-* ElasticNet
-* RandomForestRegressor
-* ExtraTreesRegressor
-* XGBoostRegressor
-* LightGBMRegressor
-* CatBoostRegressor
+Regression: Ridge, ElasticNet, RandomForestRegressor,
+ExtraTreesRegressor, XGBoostRegressor, LightGBMRegressor,
+CatBoostRegressor.
 
-Note: CatBoost's main advantage (native categorical handling) is
-irrelevant here since inputs are all-numeric embeddings. It is included
-for completeness but is unlikely to outperform LightGBM/XGBoost.
-
-### 9.3 Custom classical models (user-provided)
-
-Users can register their own classical models for inclusion in the
-HPO search. A custom model must:
-
-* Be a class with sklearn-compatible `fit(X, y)` and `predict(X)`
-  methods (and `predict_proba(X)` for classification).
-* Be passed along with a Hyperopt search space dict that defines
-  its tunable hyperparameters.
-
-Registration interface:
+**Using a built-in model (defaults):**
 
 ```python
-run_config.custom_models = [
-    {
-        "name": "my_svm",
-        "class": sklearn.svm.SVC,
-        "search_space": {
-            "C": hp.loguniform("C", ln(1e-3), ln(1e3)),
-            "kernel": hp.choice("kernel", ["rbf", "linear"]),
-        },
-        "default_params": {"probability": True},
-        "supports_early_stopping": False,
-    },
-]
+classical = ClassicalStepConfig(model_type="xgboost")
 ```
 
-Custom models are added to the model registry alongside the built-in
-models and participate in the same `hp.choice("model_type", [...])`
-search. The framework treats them identically to built-in models:
-same tuning, same validation, same evaluation.
+**Using a built-in model with custom HP space:**
 
-Requirements for custom models:
-* Must accept all search space params as constructor arguments.
-* `default_params` are always passed to the constructor (merged
-  with HPO-sampled params; HPO params take precedence).
-* If `supports_early_stopping` is True, the framework passes
-  eval_set / early_stopping_rounds during fit (same as XGBoost/
-  LightGBM). Default is False.
+```python
+classical = ClassicalStepConfig(
+    model_type="xgboost",
+    search_space={
+        "max_depth": hp.quniform("max_depth", 3, 8, 1),
+        "learning_rate": hp.loguniform("lr", ln(0.01), ln(0.3)),
+    },
+)
+```
 
-### 9.4 Classical model tuning (Hyperopt)
+**Using any custom sklearn-compatible class:**
 
-Use Hyperopt for:
+```python
+from sklearn.svm import SVC
 
-* Model family selection (categorical choice)
-* Per-family hyperparameters
+classical = ClassicalStepConfig(
+    model_type="custom",
+    model_class=SVC,
+    search_space={
+        "C": hp.loguniform("C", ln(1e-3), ln(1e3)),
+        "kernel": hp.choice("kernel", ["rbf", "linear"]),
+    },
+    fixed_params={"probability": True},
+)
+```
 
-Implementation:
+Requirements for any model:
+* Must have `fit(X, y)` and `predict(X)` methods.
+* For classification: must also have `predict_proba(X)`.
+* All search_space keys must be valid constructor arguments.
+* `fixed_params` are always passed to the constructor (not tuned).
+* `supports_early_stopping`: if True, framework passes eval_set
+  and early_stopping_rounds to fit() (for XGBoost/LightGBM/CatBoost).
 
-* `space = hp.choice("model_type", [...])`
-* Each branch has its own param space
-* Objective = validation metric on embeddings
+### 9.3 Classical model tuning (Hyperopt)
+
+Hyperopt tunes the hyperparameters of the ONE selected model.
+There is no cross-model selection -- the user picks the model,
+Hyperopt finds the best hyperparameters within its search space.
 
 Early stopping for boosted models:
 
@@ -406,8 +427,9 @@ Early stopping for boosted models:
 
 **Output**
 
-* `best_classical_model` + config
-* Per fold: train on fold-train embeddings, evaluate on fold-test
+* `best_classical_params` (best HP config found)
+* Per fold: train with best params on fold-train embeddings,
+  evaluate on fold-test
 
 ---
 
@@ -666,7 +688,69 @@ class EmbeddingModel(ABC):
         """Load model from checkpoint."""
 ```
 
-### 15.2 Top-level API (sklearn-style)
+### 15.2 Step Configuration (user's choices)
+
+```python
+@dataclass
+class EmbeddingStepConfig:
+    """Configuration for the embedding model step.
+
+    The user selects ONE embedding model and optionally provides
+    a custom search space and/or fixed parameters.
+
+    Parameters
+    ----------
+    model_type : str
+        Mode A (from-scratch): "mlp"
+        Mode B (pytorch-tabular): "tab_transformer", "tabnet",
+            "gate", "category_embedding", etc.
+    search_space : dict or None
+        Hyperopt search space for this model's hyperparameters.
+        If None, uses the built-in default space for model_type.
+    fixed_params : dict or None
+        Parameters always passed to the model (not tuned).
+        These override defaults and are merged with HPO-sampled
+        params.
+    """
+    model_type: str = "mlp"
+    search_space: dict | None = None
+    fixed_params: dict | None = None
+
+@dataclass
+class ClassicalStepConfig:
+    """Configuration for the classical model step.
+
+    The user selects ONE classical model and optionally provides
+    a custom search space and/or fixed parameters.
+
+    Parameters
+    ----------
+    model_type : str
+        Built-in: "xgboost", "lightgbm", "catboost", "ridge",
+            "logistic_regression", "random_forest", "extra_trees",
+            "elastic_net".
+        Custom: "custom" (must also set model_class).
+    model_class : type or None
+        Required when model_type="custom". Must be sklearn-compatible
+        (fit/predict/predict_proba).
+    search_space : dict or None
+        Hyperopt search space. If None, uses built-in default
+        space for model_type.
+    fixed_params : dict or None
+        Parameters always passed to the constructor (not tuned).
+    supports_early_stopping : bool
+        If True, framework passes eval_set and early_stopping_rounds
+        to fit(). Default True for xgboost/lightgbm/catboost,
+        False for everything else.
+    """
+    model_type: str = "xgboost"
+    model_class: type | None = None
+    search_space: dict | None = None
+    fixed_params: dict | None = None
+    supports_early_stopping: bool | None = None  # None = auto-detect
+```
+
+### 15.3 Top-level API (sklearn-style)
 
 ```python
 class HybridTabularModel:
@@ -676,6 +760,10 @@ class HybridTabularModel:
     ----------
     task : str
         One of 'binary', 'multiclass', 'regression'.
+    embedding : EmbeddingStepConfig
+        Which embedding model to use and how to tune it.
+    classical : ClassicalStepConfig
+        Which classical model to use and how to tune it.
     budget_config : BudgetConfig
         HPO budget and time limits.
     run_config : RunConfig, optional
@@ -697,14 +785,24 @@ pipeline stages. It does NOT aim for full sklearn estimator compliance
 (no `get_params`/`set_params`/estimator checks) -- just the familiar
 `fit`/`predict`/`predict_proba` interface.
 
-### 15.3 Experiment runner (for benchmarking)
+### 15.4 Experiment runner (for benchmarking)
 
 ```python
-def run_experiment(X, y, task_config, budget_config, run_config) -> RunResult:
+def run_experiment(
+    X, y,
+    task_config,
+    embedding_step: EmbeddingStepConfig,
+    classical_step: ClassicalStepConfig,
+    budget_config,
+    run_config,
+) -> RunResult:
     """Run full experiment with CV, HPO, evaluation, and logging.
 
     This is the function used for thesis benchmarking. It orchestrates
     the entire pipeline and produces the artifact folder.
+
+    The user has already chosen one embedding model and one classical
+    model. This function tunes their HPs and evaluates via K-fold CV.
     """
 ```
 
@@ -714,7 +812,7 @@ def run_experiment(X, y, task_config, budget_config, run_config) -> RunResult:
 
 * 5-fold stratified CV (classification) / 5-fold CV (regression)
 * Embedding HPO: 30--60 trials, max 50 epochs, patience 8
-* Classical HPO: 80--200 trials across all model families
+* Classical HPO: 80--200 trials for the selected model
 * Proxy model for embedding search:
   * classification: LogisticRegression
   * regression: Ridge
@@ -742,7 +840,9 @@ Framework is complete when:
    * Mode A: from-scratch MLP embedding + Hyperopt search
    * Mode B: pytorch-tabular adapter (TabTransformer + at least one
      other model) + Hyperopt search
-   * Classical model Hyperopt tuning on embeddings
+   * Single classical model Hyperopt tuning on embeddings
+   * User-overridable HP spaces for both embedding and classical steps
+   * Custom user-provided classical model class support
    * Full K-fold CV evaluation pipeline
 
 3. **Produces**:

@@ -40,7 +40,7 @@ T01 (scaffolding)
  |                               |       |
  |                               |       +---> T11 (MLP)
  |                               |       |
- |                               |       +---> T12 (TabTransformer)
+ |                               |       +---> T12 (pytorch-tabular adapter)
  |                               |       |
  +---> T08 (metrics) ------------+       |
  |                               |       v
@@ -280,6 +280,26 @@ class BudgetConfig:
     classical_time_budget_seconds: float | None = None
 
 @dataclass
+class EmbeddingStepConfig:
+    model_type: str = "mlp"
+    # "mlp" (Mode A) or pytorch-tabular model name (Mode B):
+    # "tab_transformer", "tabnet", "gate", "category_embedding"
+    search_space: dict | None = None   # None = use built-in defaults
+    fixed_params: dict | None = None   # always passed, not tuned
+
+@dataclass
+class ClassicalStepConfig:
+    model_type: str = "xgboost"
+    # Built-in: "xgboost", "lightgbm", "catboost", "ridge",
+    #   "logistic_regression", "random_forest", "extra_trees",
+    #   "elastic_net"
+    # Custom: "custom" (must set model_class)
+    model_class: type | None = None  # required if model_type="custom"
+    search_space: dict | None = None   # None = use built-in defaults
+    fixed_params: dict | None = None
+    supports_early_stopping: bool | None = None  # None = auto-detect
+
+@dataclass
 class RunConfig:
     n_folds: int = 5
     master_seed: int = 42
@@ -295,17 +315,8 @@ class RunConfig:
     max_categorical_cardinality: int = 1000
     # Proxy model for embedding HPO
     proxy_model: str = "linear"   # "linear" | "lightgbm"
-    # Embedding model type(s) to search
-    embedding_models: list[str] = field(
-        default_factory=lambda: ["mlp"]
-    )
     # Missingness indicator toggle
     add_missing_indicator: bool = False
-    # Custom classical models (user-provided)
-    custom_models: list[dict] | None = None
-    # Each dict: {"name": str, "class": type,
-    #   "search_space": dict, "default_params": dict,
-    #   "supports_early_stopping": bool}
 
 @dataclass
 class FoldResult:
@@ -352,6 +363,15 @@ def save_config_yaml(config, path: str) -> None:
   assert all defaults match spec Section 16.
 - `test_run_config_defaults`: create RunConfig() with no args, assert
   defaults.
+- `test_embedding_step_config_defaults`: create EmbeddingStepConfig(),
+  assert model_type="mlp", search_space=None, fixed_params=None.
+- `test_embedding_step_config_custom`: create with model_type=
+  "tab_transformer" and custom search_space dict. Assert fields set.
+- `test_classical_step_config_defaults`: create ClassicalStepConfig(),
+  assert model_type="xgboost".
+- `test_classical_step_config_custom_class`: create with
+  model_type="custom", model_class=SVC, custom search_space.
+  Assert fields set.
 - `test_validate_task_config_valid`: validate "binary", "multiclass",
   "regression" -- no error.
 - `test_validate_task_config_invalid`: validate "ranking" -- assert
@@ -1371,15 +1391,19 @@ categorical features. Binary classification target.
 
 ---
 
-### TASK T13: Classical Model Zoo
+### TASK T13: Classical Model Registry
 
 **Dependencies**: T01, T03
-**Spec reference**: Section 9.2 (Allowed model families), Section 9.3
-(Classical model tuning)
+**Spec reference**: Section 9.2 (Classical model selection),
+Section 9.3 (Classical model tuning)
 
 **Objective**: Implement `hybrid_embed/classical/model_zoo.py` with
-a registry of all classical models and their default Hyperopt search
-spaces.
+a registry of built-in classical models (each with a default search
+space), and the ability to resolve user-provided models.
+
+The user selects ONE model per experiment. The registry provides
+defaults; the user can override the search space or bring a custom
+model class.
 
 **Deliverables**:
 - `hybrid_embed/classical/model_zoo.py`
@@ -1388,20 +1412,13 @@ spaces.
 **Detailed requirements**:
 
 ```
-CLASSIFICATION_MODELS = {
+MODEL_REGISTRY = {
     "logistic_regression": {
         "class": sklearn.linear_model.LogisticRegression,
         "default_params": {"max_iter": 1000},
-        "search_space": { ... },  # Hyperopt space
+        "default_search_space": { ... },
+        "supports_early_stopping": False,
     },
-    "random_forest": { ... },
-    "extra_trees": { ... },
-    "xgboost": { ... },
-    "lightgbm": { ... },
-    "catboost": { ... },
-}
-
-REGRESSION_MODELS = {
     "ridge": { ... },
     "elastic_net": { ... },
     "random_forest": { ... },
@@ -1411,97 +1428,47 @@ REGRESSION_MODELS = {
     "catboost": { ... },
 }
 
-def get_model_registry(
+def resolve_classical_step(
+    step_config: ClassicalStepConfig,
     task: str,
-    custom_models: list[dict] | None = None,
 ) -> dict:
-    """Return the model registry for the task, including custom models.
+    """Resolve a ClassicalStepConfig into a concrete model spec.
 
-    Parameters
-    ----------
-    task : str
-        "binary", "multiclass", or "regression".
-    custom_models : list[dict] or None
-        User-provided models to add to the registry. Each dict has:
-        - "name": str (unique identifier)
-        - "class": type (sklearn-compatible class)
-        - "search_space": dict (Hyperopt search space)
-        - "default_params": dict (always passed to constructor)
-        - "supports_early_stopping": bool
+    For built-in models (model_type in MODEL_REGISTRY):
+    - Look up class, default_params, default_search_space
+    - If step_config.search_space is provided, use it instead of
+      the default
+    - If step_config.fixed_params is provided, merge with
+      default_params (user's fixed_params take precedence)
+
+    For custom models (model_type="custom"):
+    - Use step_config.model_class (required, raise ValueError if None)
+    - Use step_config.search_space (required, raise ValueError if None)
+    - Use step_config.fixed_params as default_params
 
     Returns
     -------
-    dict
-        Model name -> model spec dict. Includes both built-in and
-        custom models.
-
-    Raises
-    ------
-    ValueError
-        If a custom model name conflicts with a built-in name.
-    """
-
-def register_custom_model(
-    registry: dict,
-    name: str,
-    model_class: type,
-    search_space: dict,
-    default_params: dict | None = None,
-    supports_early_stopping: bool = False,
-) -> dict:
-    """Add a single custom model to an existing registry.
-
-    Parameters
-    ----------
-    registry : dict
-        Existing model registry to extend.
-    name : str
-        Unique name for this model.
-    model_class : type
-        Must have fit(X, y) and predict(X) methods.
-        For classification, must also have predict_proba(X).
-    search_space : dict
-        Hyperopt search space for this model's hyperparameters.
-    default_params : dict, optional
-        Parameters always passed to the constructor.
-    supports_early_stopping : bool, default False
-        If True, framework passes eval_set and
-        early_stopping_rounds to fit().
-
-    Returns
-    -------
-    dict
-        Updated registry.
-
-    Raises
-    ------
-    ValueError
-        If name conflicts with existing entry, or model_class
-        lacks required methods.
+    dict with keys:
+        "class": type
+        "params": dict (fixed/default params)
+        "search_space": dict (Hyperopt space)
+        "supports_early_stopping": bool
     """
 
 def build_model(
-    model_name: str,
+    model_class: type,
     params: dict,
     task: str,
     random_state: int = 42,
-    registry: dict | None = None,
 ) -> object:
     """Instantiate a classical model with given parameters.
 
-    Handles task-specific configuration for built-in models:
+    Handles task-specific configuration for known models:
     - XGBoost: set objective based on task, eval_metric, etc.
     - LightGBM: set objective, verbose=-1
     - CatBoost: set verbose=0, loss_function based on task
 
-    For custom models: merges default_params with HPO-sampled
-    params (HPO params take precedence), then instantiates.
-
-    Parameters
-    ----------
-    registry : dict, optional
-        If provided, look up model_name here instead of the
-        default built-in registry.
+    For unknown/custom classes: pass params directly to constructor.
 
     Returns sklearn-compatible model with fit/predict/predict_proba.
     """
@@ -1548,39 +1515,33 @@ Generate synthetic embedding data:
 
 Tests:
 
-- `test_get_model_registry_classification`: assert all expected model
-  names are present.
-- `test_get_model_registry_regression`: assert all expected model
-  names are present.
-- `test_build_model_each_classifier`: loop through all classification
-  models, build each, assert has fit and predict_proba methods.
-- `test_build_model_each_regressor`: loop through all regression
-  models, build each, assert has fit and predict methods.
-- `test_train_logistic_regression`: build + train + predict on
-  synthetic data. Assert predictions have correct shape.
+- `test_resolve_builtin_model_defaults`: resolve ClassicalStepConfig
+  with model_type="xgboost", no overrides. Assert returns correct
+  class, default search space, supports_early_stopping=True.
+- `test_resolve_builtin_model_custom_space`: resolve with
+  model_type="xgboost" and user-provided search_space. Assert
+  the user's space is used, not the default.
+- `test_resolve_builtin_model_fixed_params`: resolve with
+  model_type="ridge" and fixed_params={"alpha": 1.0}. Assert
+  fixed params are merged.
+- `test_resolve_custom_model`: resolve with model_type="custom",
+  model_class=KNeighborsClassifier, search_space and fixed_params.
+  Assert all fields correct.
+- `test_resolve_custom_model_missing_class`: model_type="custom"
+  but model_class=None. Assert ValueError.
+- `test_resolve_custom_model_missing_space`: model_type="custom"
+  with model_class but search_space=None. Assert ValueError.
+- `test_build_model_xgboost`: build with XGBClassifier params,
+  assert has fit/predict/predict_proba.
+- `test_build_model_custom`: build with KNeighborsClassifier,
+  assert has fit/predict.
 - `test_train_xgboost_with_early_stopping`: train with val set,
   assert model converges.
 - `test_train_lightgbm_with_early_stopping`: same.
-- `test_train_catboost_with_early_stopping`: same.
-- `test_train_random_forest`: train without val set. Assert
-  predictions correct shape.
-- `test_register_custom_model`: create a simple custom sklearn
-  model (e.g., KNeighborsClassifier), register it with a search
-  space, assert it appears in the registry.
-- `test_register_custom_model_name_conflict`: register with a name
-  that conflicts with a built-in ("xgboost"). Assert ValueError.
-- `test_register_custom_model_missing_methods`: register a class
-  without fit/predict. Assert ValueError.
-- `test_build_custom_model`: register a custom model, build it
-  with sampled params, assert it has fit/predict methods.
-- `test_train_custom_model`: register, build, train, predict on
-  synthetic embedding data. Assert predictions correct shape.
-- `test_custom_model_default_params_merged`: register with
-  default_params={"n_neighbors": 3}, build with HPO params
-  {"n_neighbors": 5}. Assert HPO param wins (n_neighbors=5).
-- `test_get_registry_with_custom_models`: pass custom_models
-  list to get_model_registry, assert both built-in and custom
-  models are present.
+- `test_train_ridge`: train without val set. Assert predictions
+  correct shape.
+- `test_train_custom_model`: build + train + predict with a custom
+  class. Assert predictions correct shape.
 
 ---
 ---
@@ -1652,14 +1613,25 @@ def get_pytorch_tabular_search_space(model_type: str) -> dict:
     Additional model types follow similar patterns.
     """
 
-def get_classical_search_space(task: str) -> dict:
-    """Return Hyperopt search space for classical model selection.
+def resolve_embedding_search_space(
+    step_config: EmbeddingStepConfig,
+) -> dict:
+    """Return the effective search space for the embedding step.
 
-    Uses hp.choice at the top level to select model family,
-    then each branch has its own param space.
+    If step_config.search_space is provided, return it.
+    Otherwise, return the default space for step_config.model_type.
+    """
 
-    task determines whether classification or regression models
-    are included.
+def resolve_classical_search_space(
+    step_config: ClassicalStepConfig,
+    task: str,
+) -> dict:
+    """Return the effective search space for the classical step.
+
+    If step_config.search_space is provided, return it.
+    Otherwise, look up the default space for step_config.model_type
+    from MODEL_REGISTRY.
+    For custom models, step_config.search_space is required.
     """
 
 def sample_from_space(space: dict) -> dict:
@@ -1686,31 +1658,35 @@ def postprocess_pytorch_tabular_params(
     - Add model_type to the returned dict
     """
 
-def postprocess_classical_params(params: dict) -> tuple[str, dict]:
-    """Convert Hyperopt sample to (model_name, clean_params).
+def postprocess_classical_params(params: dict) -> dict:
+    """Convert Hyperopt sample to clean params dict.
 
-    Returns the model name and its cleaned hyperparameters.
+    - Cast values to correct types
+    - Resolve hp.choice indices to actual values
     """
 ```
 
 **Testing requirements** (`tests/hpo/test_spaces.py`):
 
-- `test_mlp_space_sample`: sample 10 configs, assert all have
-  required keys with values in valid ranges.
-- `test_pytorch_tabular_space_sample_tab_transformer`: sample 10
-  configs for "tab_transformer", assert required keys and valid ranges.
-- `test_pytorch_tabular_space_sample_category_embedding`: sample 10
-  configs for "category_embedding", assert required keys.
-- `test_classical_space_sample_classification`: sample 10, assert
-  each has a model_name key.
-- `test_classical_space_sample_regression`: sample 10, assert each
-  has a model_name key.
+- `test_mlp_default_space_sample`: sample 10 configs from default
+  MLP space, assert all have required keys with valid ranges.
+- `test_pytorch_tabular_default_space_tab_transformer`: sample 10
+  configs for "tab_transformer", assert required keys and ranges.
+- `test_resolve_embedding_space_default`: pass EmbeddingStepConfig
+  with search_space=None. Assert returns the default space.
+- `test_resolve_embedding_space_override`: pass EmbeddingStepConfig
+  with custom search_space. Assert returns the user's space.
+- `test_resolve_classical_space_default`: pass ClassicalStepConfig
+  with model_type="xgboost", search_space=None. Assert returns
+  the default XGBoost space.
+- `test_resolve_classical_space_override`: pass with custom space.
+  Assert returns user's space.
 - `test_postprocess_mlp_params`: sample, postprocess, assert
   hidden_dims is a list[int] of correct length.
 - `test_postprocess_pytorch_tabular_valid`: sample, postprocess for
-  "tab_transformer". Assert no error and model_type is in result.
+  "tab_transformer". Assert no error.
 - `test_postprocess_classical_params`: sample, postprocess, assert
-  returns (str, dict).
+  returns dict with correct types.
 
 ---
 
@@ -1738,7 +1714,7 @@ def hyperopt_search_embedding(
     n_numeric: int,
     n_categories_per_column: list[int],
     n_classes: int | None,
-    embedding_model_type: str,  # "mlp" or "tab_transformer" (or other pytorch-tabular model)
+    embedding_step: EmbeddingStepConfig,
     proxy_model: str = "linear",
     max_trials: int = 50,
     max_epochs: int = 50,
@@ -1748,24 +1724,21 @@ def hyperopt_search_embedding(
     device: str = "cpu",
     logger: LocalLogger | None = None,
 ) -> dict:
-    """Run Hyperopt TPE search for embedding model hyperparameters.
+    """Run Hyperopt TPE search for the selected embedding model's HPs.
+
+    Tunes the ONE model specified in embedding_step.model_type
+    within its search space (user-provided or default).
 
     Per trial:
-    1. Sample hyperparameters from the appropriate search space.
-    2. Postprocess params.
-    3. Build and train embedding model (with early stopping).
-    4. Extract embeddings for train and val.
-    5. Train proxy model on embeddings.
-    6. Score proxy model on val embeddings.
-    7. Log trial to logger (if provided).
-    8. Return negative score for Hyperopt.
-
-    If time_budget_seconds is set, stop launching new trials once
-    the wall-clock budget is exceeded.
-
-    Parameters
-    ----------
-    ... (as above)
+    1. Sample hyperparameters from the search space.
+    2. Merge with embedding_step.fixed_params.
+    3. Postprocess params.
+    4. Build and train embedding model (with early stopping).
+    5. Extract embeddings for train and val.
+    6. Train proxy model on embeddings.
+    7. Score proxy model on val embeddings.
+    8. Log trial to logger (if provided).
+    9. Return negative score for Hyperopt.
 
     Returns
     -------
@@ -1850,28 +1823,31 @@ def hyperopt_search_classical(
     E_val: np.ndarray,
     y_val: np.ndarray,
     task: str,
+    classical_step: ClassicalStepConfig,
     max_trials: int = 150,
     time_budget_seconds: float | None = None,
     master_seed: int = 42,
-    custom_models: list[dict] | None = None,
     logger: LocalLogger | None = None,
 ) -> dict:
-    """Run Hyperopt TPE search for classical model selection + tuning.
+    """Run Hyperopt TPE search for the selected classical model's HPs.
+
+    Tunes the ONE model specified in classical_step within its
+    search space (user-provided or default).
 
     Per trial:
-    1. Sample (model_type, hyperparams) from classical search space.
-    2. Postprocess params.
-    3. Build model.
-    4. Train model (with early stopping for boosted models if val
+    1. Sample hyperparams from the search space.
+    2. Merge with classical_step.fixed_params.
+    3. Postprocess params.
+    4. Build model.
+    5. Train model (with early stopping if supported and val
        data provided).
-    5. Compute validation metric.
-    6. Log trial.
-    7. Return negative score.
+    6. Compute validation metric.
+    7. Log trial.
+    8. Return negative score.
 
     Returns
     -------
     dict with keys:
-        "best_model_name": str
         "best_params": dict
         "best_score": float
         "n_trials_completed": int
@@ -1883,22 +1859,24 @@ def hyperopt_search_classical(
 
 Generate synthetic embedding data (200 train, 50 val, 64 features).
 
-- `test_classical_search_binary`: run with max_trials=5, binary task.
-  Assert returns dict with required keys.
-- `test_classical_search_multiclass`: max_trials=5, multiclass.
+- `test_classical_search_xgboost_binary`: run with
+  ClassicalStepConfig(model_type="xgboost"), max_trials=5,
+  binary task. Assert returns dict with required keys.
+- `test_classical_search_ridge_regression`: run with
+  ClassicalStepConfig(model_type="ridge"), max_trials=5.
   Assert valid output.
-- `test_classical_search_regression`: max_trials=5, regression.
+- `test_classical_search_custom_space`: run with
+  ClassicalStepConfig(model_type="xgboost",
+  search_space={custom narrow space}). Assert trials stay within
+  the custom space.
+- `test_classical_search_custom_model`: run with
+  ClassicalStepConfig(model_type="custom",
+  model_class=KNeighborsClassifier, search_space={...}).
   Assert valid output.
 - `test_classical_search_logs_trials`: provide logger, assert JSONL
   has correct number of lines.
 - `test_classical_search_time_budget`: set short time budget, many
   trials. Assert exits within budget.
-- `test_classical_search_best_model_is_buildable`: take best_model_name
-  and best_params, build_model with them, assert succeeds.
-- `test_classical_search_with_custom_model`: pass a custom model
-  (e.g., KNeighborsClassifier with hp space for n_neighbors).
-  Run search with max_trials=5. Assert the custom model can be
-  selected as best. Assert it appears in trial logs.
 
 ---
 ---
@@ -1928,10 +1906,16 @@ def run_experiment(
     X: pd.DataFrame,
     y: pd.Series | np.ndarray,
     task_config: TaskConfig,
+    embedding_step: EmbeddingStepConfig,
+    classical_step: ClassicalStepConfig,
     budget_config: BudgetConfig,
     run_config: RunConfig,
 ) -> RunResult:
     """Run full experiment pipeline.
+
+    The user has already chosen ONE embedding model and ONE
+    classical model. This function tunes their hyperparameters
+    and evaluates via K-fold CV.
 
     Steps:
     1. seed_everything(run_config.master_seed)
@@ -1942,13 +1926,11 @@ def run_experiment(
        a. Fit preprocessor on fold-0 train
        b. Transform fold-0 train/val
        c. Transform target
-       d. For each embedding_model_type in run_config:
-          - Run embedding HPO search
-          - Keep the best across all model types
+       d. Run embedding HPO for the selected model
        e. Using best embedding config:
           - Train embedding model on fold-0 train
           - Extract fold-0 train/val embeddings
-          - Run classical HPO search on embeddings
+          - Run classical HPO for the selected model
     6. Per-fold evaluation:
        For each fold:
        a. Fit fresh preprocessor on this fold's train
@@ -1968,6 +1950,8 @@ def run_experiment(
     X : pd.DataFrame
     y : pd.Series or np.ndarray
     task_config : TaskConfig
+    embedding_step : EmbeddingStepConfig
+    classical_step : ClassicalStepConfig
     budget_config : BudgetConfig
     run_config : RunConfig
 
@@ -1986,18 +1970,23 @@ class HybridTabularModel:
     Parameters
     ----------
     task : str
+    embedding : EmbeddingStepConfig
+        Which embedding model to use.
+    classical : ClassicalStepConfig
+        Which classical model to use.
     budget_config : BudgetConfig, optional
     run_config : RunConfig, optional
     """
 
-    def __init__(self, task, budget_config=None, run_config=None): ...
+    def __init__(self, task, embedding, classical,
+                 budget_config=None, run_config=None): ...
 
     def fit(self, X, y):
         """Run HPO + train best models.
 
-        For prediction purposes, trains a single embedding model
-        and a single classical model using the best configs found
-        during HPO. Uses a single train/val split (not full CV).
+        Tunes the selected embedding and classical models,
+        trains with best configs found during HPO.
+        Uses a single train/val split (not full CV).
         """
 
     def predict(self, X):
@@ -2074,15 +2063,24 @@ Arguments:
     Column name for target. If using built-in datasets, inferred
     automatically.
 --n-folds: int (default 5)
---embed-models: str (default "mlp")
-    Comma-separated: "mlp", "tab_transformer", "mlp,tab_transformer"
+--embed-model: str (default "mlp")
+    ONE of: "mlp", "tab_transformer", "tabnet", "gate",
+    "category_embedding"
 --embed-trials: int (default 50)
 --embed-max-epochs: int (default 50)
+--classical-model: str (default "xgboost")
+    ONE of: "xgboost", "lightgbm", "catboost", "ridge",
+    "logistic_regression", "random_forest", "extra_trees",
+    "elastic_net"
 --classical-trials: int (default 150)
 --device: str (default "auto")
 --seed: int (default 42)
 --output-dir: str (default "runs")
 --save-embeddings: flag (default False)
+
+Note: the CLI uses default HP spaces. For custom HP spaces or
+custom model classes, use the Python API directly (see
+expected_usage_examples/).
 ```
 
 Implement dataset loading:
@@ -2191,7 +2189,7 @@ def test_end_to_end_regression():
 def test_end_to_end_tab_transformer():
     """Full pipeline using TabTransformer via pytorch-tabular adapter.
 
-    Same as binary test but with embedding_models=["tab_transformer"].
+    Same as binary test but with EmbeddingStepConfig(model_type="tab_transformer").
     Budget: 2 embed trials, 3 epochs, 3 classical trials, 2 folds.
 
     Asserts:
@@ -2237,7 +2235,7 @@ def test_embeddings_only_constraint():
 | T10 | Embedding base class           | 3     | T01, T03, T02           | Small            |
 | T11 | MLP embedding model            | 3     | T10, T02, T07           | Large            |
 | T12 | pytorch-tabular adapter        | 3     | T10, T02, T07           | Medium           |
-| T13 | Classical model zoo            | 4     | T01, T03                | Medium           |
+| T13 | Classical model registry       | 4     | T01, T03                | Medium           |
 | T14 | HPO search spaces              | 5     | T01, T03                | Small            |
 | T15 | Embedding HPO search           | 5     | T10-T12, T14, T08, T09 | Medium           |
 | T16 | Classical HPO search           | 5     | T13, T14, T08, T09     | Medium           |
