@@ -301,6 +301,11 @@ class RunConfig:
     )
     # Missingness indicator toggle
     add_missing_indicator: bool = False
+    # Custom classical models (user-provided)
+    custom_models: list[dict] | None = None
+    # Each dict: {"name": str, "class": type,
+    #   "search_space": dict, "default_params": dict,
+    #   "supports_early_stopping": bool}
 
 @dataclass
 class FoldResult:
@@ -1406,18 +1411,73 @@ REGRESSION_MODELS = {
     "catboost": { ... },
 }
 
-def get_model_registry(task: str) -> dict:
-    """Return the appropriate model registry for the task.
+def get_model_registry(
+    task: str,
+    custom_models: list[dict] | None = None,
+) -> dict:
+    """Return the model registry for the task, including custom models.
 
     Parameters
     ----------
     task : str
         "binary", "multiclass", or "regression".
+    custom_models : list[dict] or None
+        User-provided models to add to the registry. Each dict has:
+        - "name": str (unique identifier)
+        - "class": type (sklearn-compatible class)
+        - "search_space": dict (Hyperopt search space)
+        - "default_params": dict (always passed to constructor)
+        - "supports_early_stopping": bool
 
     Returns
     -------
     dict
-        Model name -> model spec dict.
+        Model name -> model spec dict. Includes both built-in and
+        custom models.
+
+    Raises
+    ------
+    ValueError
+        If a custom model name conflicts with a built-in name.
+    """
+
+def register_custom_model(
+    registry: dict,
+    name: str,
+    model_class: type,
+    search_space: dict,
+    default_params: dict | None = None,
+    supports_early_stopping: bool = False,
+) -> dict:
+    """Add a single custom model to an existing registry.
+
+    Parameters
+    ----------
+    registry : dict
+        Existing model registry to extend.
+    name : str
+        Unique name for this model.
+    model_class : type
+        Must have fit(X, y) and predict(X) methods.
+        For classification, must also have predict_proba(X).
+    search_space : dict
+        Hyperopt search space for this model's hyperparameters.
+    default_params : dict, optional
+        Parameters always passed to the constructor.
+    supports_early_stopping : bool, default False
+        If True, framework passes eval_set and
+        early_stopping_rounds to fit().
+
+    Returns
+    -------
+    dict
+        Updated registry.
+
+    Raises
+    ------
+    ValueError
+        If name conflicts with existing entry, or model_class
+        lacks required methods.
     """
 
 def build_model(
@@ -1425,13 +1485,23 @@ def build_model(
     params: dict,
     task: str,
     random_state: int = 42,
+    registry: dict | None = None,
 ) -> object:
     """Instantiate a classical model with given parameters.
 
-    Handles task-specific configuration:
+    Handles task-specific configuration for built-in models:
     - XGBoost: set objective based on task, eval_metric, etc.
     - LightGBM: set objective, verbose=-1
     - CatBoost: set verbose=0, loss_function based on task
+
+    For custom models: merges default_params with HPO-sampled
+    params (HPO params take precedence), then instantiates.
+
+    Parameters
+    ----------
+    registry : dict, optional
+        If provided, look up model_name here instead of the
+        default built-in registry.
 
     Returns sklearn-compatible model with fit/predict/predict_proba.
     """
@@ -1494,6 +1564,23 @@ Tests:
 - `test_train_catboost_with_early_stopping`: same.
 - `test_train_random_forest`: train without val set. Assert
   predictions correct shape.
+- `test_register_custom_model`: create a simple custom sklearn
+  model (e.g., KNeighborsClassifier), register it with a search
+  space, assert it appears in the registry.
+- `test_register_custom_model_name_conflict`: register with a name
+  that conflicts with a built-in ("xgboost"). Assert ValueError.
+- `test_register_custom_model_missing_methods`: register a class
+  without fit/predict. Assert ValueError.
+- `test_build_custom_model`: register a custom model, build it
+  with sampled params, assert it has fit/predict methods.
+- `test_train_custom_model`: register, build, train, predict on
+  synthetic embedding data. Assert predictions correct shape.
+- `test_custom_model_default_params_merged`: register with
+  default_params={"n_neighbors": 3}, build with HPO params
+  {"n_neighbors": 5}. Assert HPO param wins (n_neighbors=5).
+- `test_get_registry_with_custom_models`: pass custom_models
+  list to get_model_registry, assert both built-in and custom
+  models are present.
 
 ---
 ---
@@ -1766,6 +1853,7 @@ def hyperopt_search_classical(
     max_trials: int = 150,
     time_budget_seconds: float | None = None,
     master_seed: int = 42,
+    custom_models: list[dict] | None = None,
     logger: LocalLogger | None = None,
 ) -> dict:
     """Run Hyperopt TPE search for classical model selection + tuning.
@@ -1807,6 +1895,10 @@ Generate synthetic embedding data (200 train, 50 val, 64 features).
   trials. Assert exits within budget.
 - `test_classical_search_best_model_is_buildable`: take best_model_name
   and best_params, build_model with them, assert succeeds.
+- `test_classical_search_with_custom_model`: pass a custom model
+  (e.g., KNeighborsClassifier with hp space for n_neighbors).
+  Run search with max_trials=5. Assert the custom model can be
+  selected as best. Assert it appears in trial logs.
 
 ---
 ---

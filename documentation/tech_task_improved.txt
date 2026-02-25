@@ -346,7 +346,47 @@ Note: CatBoost's main advantage (native categorical handling) is
 irrelevant here since inputs are all-numeric embeddings. It is included
 for completeness but is unlikely to outperform LightGBM/XGBoost.
 
-### 9.3 Classical model tuning (Hyperopt)
+### 9.3 Custom classical models (user-provided)
+
+Users can register their own classical models for inclusion in the
+HPO search. A custom model must:
+
+* Be a class with sklearn-compatible `fit(X, y)` and `predict(X)`
+  methods (and `predict_proba(X)` for classification).
+* Be passed along with a Hyperopt search space dict that defines
+  its tunable hyperparameters.
+
+Registration interface:
+
+```python
+run_config.custom_models = [
+    {
+        "name": "my_svm",
+        "class": sklearn.svm.SVC,
+        "search_space": {
+            "C": hp.loguniform("C", ln(1e-3), ln(1e3)),
+            "kernel": hp.choice("kernel", ["rbf", "linear"]),
+        },
+        "default_params": {"probability": True},
+        "supports_early_stopping": False,
+    },
+]
+```
+
+Custom models are added to the model registry alongside the built-in
+models and participate in the same `hp.choice("model_type", [...])`
+search. The framework treats them identically to built-in models:
+same tuning, same validation, same evaluation.
+
+Requirements for custom models:
+* Must accept all search space params as constructor arguments.
+* `default_params` are always passed to the constructor (merged
+  with HPO-sampled params; HPO params take precedence).
+* If `supports_early_stopping` is True, the framework passes
+  eval_set / early_stopping_rounds during fit (same as XGBoost/
+  LightGBM). Default is False.
+
+### 9.4 Classical model tuning (Hyperopt)
 
 Use Hyperopt for:
 
