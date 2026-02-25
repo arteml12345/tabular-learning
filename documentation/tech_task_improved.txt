@@ -308,67 +308,22 @@ to extract embeddings.
 
 ## 8. Hyperparameter Optimization (Hyperopt)
 
-### 8.1 Two modes of operation
-
-The framework supports two modes. In both, the HPO logic is
-identical -- only the source of train/val splits differs.
-
-#### Mode 1: K-fold CV (`run_experiment`)
-
-Used for thesis benchmarking, where you need robust metrics with
-confidence intervals (mean +/- std).
+### 8.1 CV + HPO interaction (critical design decision)
 
 **Strategy: HPO once, evaluate across folds.**
 
-1. Split the data into K folds (e.g., 5).
-2. Designate fold-0 as the HPO fold. Its train portion is used
-   as HPO-train, its val portion as HPO-val.
-3. Run embedding HPO and classical HPO on fold-0 (train/val).
-4. Record the best embedding config and best classical config.
-5. For all K folds: train a fresh embedding model with best config,
-   extract embeddings, train a fresh classical model with best
-   config, evaluate on the fold's test portion.
-6. Aggregate metrics across K folds (mean +/- std).
+1. From the K-fold split, designate fold-0 as the HPO split.
+2. Run embedding HPO and classical HPO on fold-0 (train/val).
+3. Record the best embedding config and best classical config.
+4. For all K folds: train embedding model with best config, extract
+   embeddings, train classical model with best config, evaluate on
+   test fold.
+5. Aggregate metrics across K folds (mean +/- std).
 
-The aggregated metrics are **only for reporting** -- they appear
-in your thesis tables and tell you how well a given combination
-performs. They are NOT used to make any further algorithmic
-decisions. The K-fold evaluation gives you statistically robust
-numbers with confidence intervals; a single split cannot.
-
-Rationale: full HPO per fold is K times more expensive and
-impractical for thesis-scale compute. The single-HPO approach is
-standard practice in AutoML literature.
-
-#### Mode 2: Single train/test split (`HybridTabularModel`)
-
-Used for fast iteration, prototyping, or when you manage your
-own data splits.
-
-The user provides `X_train, y_train` to `fit()` and keeps
-`X_test` aside for later evaluation with `predict()`.
-
-**Pipeline inside `fit(X_train, y_train)`:**
-
-1. Validate and infer schema from `X_train`.
-2. Internally split `X_train` into HPO-train and HPO-val
-   (controlled by `RunConfig.val_fraction`, default 0.2).
-3. Fit preprocessor on HPO-train, transform both.
-4. Run embedding HPO on HPO-train / HPO-val.
-5. Train best embedding model, extract embeddings.
-6. Run classical HPO on the embeddings.
-7. Retrain final embedding model + classical model using the
-   best configs found (on the full `X_train`).
-8. Store trained models internally.
-
-**When the user calls `predict(X_test)`:**
-
-1. Preprocess `X_test` using the fitted preprocessor.
-2. Run through the trained embedding model -> extract embeddings.
-3. Feed embeddings to the trained classical model -> predictions.
-
-No aggregation, no fold-level metrics. The user evaluates
-predictions themselves using sklearn metrics or any other tool.
+Rationale: full HPO per fold is K times more expensive and impractical
+for thesis-scale compute. The single-HPO approach is standard practice
+in AutoML literature. The K-fold evaluation still provides robust
+performance estimates.
 
 ### 8.2 General strategy
 
