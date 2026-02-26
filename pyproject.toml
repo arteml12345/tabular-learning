@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hybrid_embed"
+version = "0.1.0"
+description = "Hybrid tabular framework: PyTorch embeddings fed to classical predictors"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scikit-learn>=1.3",
+    "scipy>=1.11",
+    "pyyaml>=6.0",
+    "torch>=2.0",
+    "pytorch_tabular>=1.1",
+    "lightgbm>=4.0",
+    "xgboost>=2.0",
+    "catboost>=1.2",
+    "hyperopt>=0.2.7",
+    "joblib>=1.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.4"]
+benchmarks = ["openml>=0.14"]
+
+[tool.setuptools.packages.find]
+include = ["hybrid_embed*"]
