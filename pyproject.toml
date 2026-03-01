@@ -31,3 +31,6 @@ include = ["hybrid_embed*"]
 
 [tool.pytest.ini_options]
 testpaths = ["hybrid_embed"]
+markers = [
+    "slow: marks tests as slow (run with pytest -m slow, skip with pytest -m 'not slow')",
+]

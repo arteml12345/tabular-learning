@@ -205,19 +205,18 @@ class PytorchTabularEmbeddingModel(EmbeddingModel):
         elif device_str == "mps":
             accelerator = "mps"
 
-        early_stopping_kwargs: dict[str, Any] = {}
         if patience is not None:
             early_stopping = "valid_loss"
-            early_stopping_kwargs = {"patience": int(patience)}
+            es_patience = int(patience)
         else:
             early_stopping = None
+            es_patience = 3
 
         trainer_config = TrainerConfig(
             max_epochs=max_epochs,
             batch_size=batch_size,
             early_stopping=early_stopping,
-            early_stopping_patience=int(patience) if patience else 3,
-            early_stopping_kwargs=early_stopping_kwargs,
+            early_stopping_patience=es_patience,
             checkpoints=None,
             progress_bar="none",
             accelerator=accelerator,
