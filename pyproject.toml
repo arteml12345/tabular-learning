@@ -28,3 +28,6 @@ benchmarks = ["openml>=0.14"]
 
 [tool.setuptools.packages.find]
 include = ["hybrid_embed*"]
+
+[tool.pytest.ini_options]
+testpaths = ["hybrid_embed"]
