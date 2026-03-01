@@ -398,6 +398,7 @@ def train_classical_model(
 
     if supports_early_stopping and E_val is not None and y_val is not None:
         if isinstance(model, (xgboost.XGBClassifier, xgboost.XGBRegressor)):
+            model.set_params(early_stopping_rounds=early_stopping_rounds)
             model.fit(
                 E_train, y_train,
                 eval_set=[(E_val, y_val)],

@@ -338,16 +338,17 @@ class MLPEmbeddingModel(EmbeddingModel):
         Returns
         -------
         np.ndarray
-            Class labels (classification) or values (regression).
+            Shape ``(n_samples,)``. Class labels (classification)
+            or values (regression).
         """
         raw = self._predict_raw(X)
         if self.task == "binary":
-            proba = torch.sigmoid(torch.tensor(raw)).numpy()
+            proba = torch.sigmoid(torch.tensor(raw.squeeze(-1))).numpy()
             return (proba >= 0.5).astype(int)
         elif self.task == "multiclass":
             return np.argmax(raw, axis=1)
         else:
-            return raw
+            return raw.squeeze(-1)
 
     def predict_proba(self, X: dict) -> np.ndarray:
         """Predict probabilities (classification only).
@@ -413,6 +414,20 @@ class MLPEmbeddingModel(EmbeddingModel):
         path : str
             File path for the checkpoint.
         """
+        trunk = self._model.trunk
+        has_layer_norm = any(isinstance(m, nn.LayerNorm) for m in trunk)
+        act_name = "relu"
+        for m in trunk:
+            for name, cls in _ACTIVATIONS.items():
+                if isinstance(m, cls):
+                    act_name = name
+                    break
+        dropout_val = 0.1
+        for m in trunk:
+            if isinstance(m, nn.Dropout):
+                dropout_val = m.p
+                break
+
         torch.save({
             "model_state_dict": self._model.state_dict(),
             "task": self.task,
@@ -425,6 +440,9 @@ class MLPEmbeddingModel(EmbeddingModel):
                 "hidden_dims": self._model.hidden_dims,
                 "embedding_layer": self._model.embedding_layer,
                 "task": self._model.task,
+                "dropout": dropout_val,
+                "activation": act_name,
+                "use_layer_norm": has_layer_norm,
             },
         }, path)
 
@@ -459,6 +477,9 @@ class MLPEmbeddingModel(EmbeddingModel):
             embedding_layer=mc["embedding_layer"],
             task=mc["task"],
             n_classes=instance.n_classes,
+            dropout=mc.get("dropout", 0.1),
+            activation=mc.get("activation", "relu"),
+            use_layer_norm=mc.get("use_layer_norm", False),
         )
         instance._model.load_state_dict(checkpoint["model_state_dict"])
         instance._device = torch.device("cpu")

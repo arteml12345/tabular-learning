@@ -211,6 +211,67 @@ def test_mlp_save_load_roundtrip():
     print("Test passed: save/load roundtrip preserves embeddings")
 
 
+def test_mlp_save_load_nondefault_architecture():
+    """Save/load must work with non-default dropout, activation, layer_norm."""
+    seed_everything(42)
+    X, y = _make_synthetic_data()
+    n_train = 150
+    X_train = {k: v[:n_train] for k, v in X.items()}
+    X_val = {k: v[n_train:] for k, v in X.items()}
+    y_train, y_val = y[:n_train], y[n_train:]
+
+    model = MLPEmbeddingModel(
+        task="binary", n_numeric=5,
+        n_categories_per_column=[10, 5, 8], n_classes=2,
+    )
+    config = _small_config(
+        activation="gelu", use_layer_norm=True, dropout=0.3,
+    )
+    model.fit(X_train, y_train, X_val, y_val, config)
+    emb_before = model.encode(X_train)
+
+    tmpdir = tempfile.mkdtemp()
+    path = os.path.join(tmpdir, "mlp_nondefault.pt")
+    model.save(path)
+
+    loaded = MLPEmbeddingModel.load(path)
+    emb_after = loaded.encode(X_train)
+    print(f"Max diff after load (non-default arch): "
+          f"{np.abs(emb_before - emb_after).max()}")
+
+    np.testing.assert_allclose(emb_before, emb_after, atol=1e-6)
+    assert loaded.embedding_dim == model.embedding_dim
+    print("Test passed: save/load preserves non-default architecture")
+
+
+def test_mlp_predict_shapes():
+    """Predict should return 1-D arrays for all task types."""
+    seed_everything(42)
+    X, y = _make_synthetic_data()
+    n_train = 150
+    X_train = {k: v[:n_train] for k, v in X.items()}
+    X_val = {k: v[n_train:] for k, v in X.items()}
+    X_test = {k: v[n_train:] for k, v in X.items()}
+    y_train, y_val = y[:n_train], y[n_train:]
+
+    for task in ("binary", "regression"):
+        seed_everything(42)
+        model = MLPEmbeddingModel(
+            task=task, n_numeric=5,
+            n_categories_per_column=[10, 5, 8],
+            n_classes=2 if task == "binary" else None,
+        )
+        model.fit(X_train, y_train, X_val, y_val, _small_config())
+        preds = model.predict(X_test)
+        print(f"  {task}: predict shape = {preds.shape}")
+        assert preds.ndim == 1, (
+            f"Expected 1-D for {task}, got shape {preds.shape}"
+        )
+        assert preds.shape == (50,)
+
+    print("Test passed: predict returns 1-D arrays for all tasks")
+
+
 def test_mlp_early_stopping():
     """Training should stop before max_epochs with small patience."""
     seed_everything(42)
