@@ -245,3 +245,100 @@ def test_hybrid_tabular_model_predict_proba():
     assert np.allclose(row_sums, 1.0, atol=1e-6), "Probabilities don't sum to 1"
 
     print("Test passed: predict_proba returns valid probabilities")
+
+
+def _make_regression_data(n=200, seed=42):
+    """Generate regression data with a large-scale target (mean ~100)."""
+    rng = np.random.RandomState(seed)
+    df = pd.DataFrame({
+        "num_0": rng.randn(n),
+        "num_1": rng.randn(n),
+        "num_2": rng.randn(n),
+        "num_3": rng.randn(n),
+        "cat_0": rng.choice(["A", "B", "C"], size=n),
+    })
+    y = 100.0 + 5.0 * df["num_0"].values + 3.0 * df["num_1"].values + rng.randn(n) * 0.5
+    return df, y
+
+
+def _make_string_label_data(n=150, seed=42):
+    """Generate binary data with string labels instead of 0/1."""
+    rng = np.random.RandomState(seed)
+    df = pd.DataFrame({
+        "num_0": rng.randn(n),
+        "num_1": rng.randn(n),
+        "num_2": rng.randn(n),
+        "num_3": rng.randn(n),
+        "cat_0": rng.choice(["A", "B", "C"], size=n),
+    })
+    raw = (df["num_0"] + df["num_1"] > 0).astype(int)
+    y = np.where(raw == 1, "positive", "negative")
+    return df, y
+
+
+def test_predict_regression_original_scale():
+    """predict() on regression must return values in the original target scale."""
+    tmpdir = tempfile.mkdtemp()
+    df, y = _make_regression_data()
+
+    model = HybridTabularModel(
+        task="regression",
+        embedding=EmbeddingStepConfig(model_type="mlp"),
+        classical=ClassicalStepConfig(model_type="xgboost"),
+        budget_config=BudgetConfig(
+            embed_hpo_max_trials=2,
+            embed_max_epochs=3,
+            embed_patience=2,
+            classical_hpo_max_trials=3,
+        ),
+        run_config=RunConfig(
+            master_seed=42, device="cpu",
+            output_dir=tmpdir, dataset_id="reg_scale_test",
+        ),
+    )
+    model.fit(df, y)
+    preds = model.predict(df)
+
+    print(f"Original y mean: {y.mean():.2f}, std: {y.std():.2f}")
+    print(f"Predicted  mean: {preds.mean():.2f}, std: {preds.std():.2f}")
+
+    assert preds.mean() > 50, (
+        f"Predictions should be near original scale (~100), got mean={preds.mean():.2f}"
+    )
+    assert abs(preds.mean() - y.mean()) < 20, (
+        f"Predicted mean too far from original: {preds.mean():.2f} vs {y.mean():.2f}"
+    )
+    print("Test passed: regression predictions are in original scale")
+
+
+def test_predict_classification_original_labels():
+    """predict() on classification with string labels returns original label values."""
+    tmpdir = tempfile.mkdtemp()
+    df, y = _make_string_label_data()
+
+    model = HybridTabularModel(
+        task="binary",
+        embedding=EmbeddingStepConfig(model_type="mlp"),
+        classical=ClassicalStepConfig(model_type="xgboost"),
+        budget_config=BudgetConfig(
+            embed_hpo_max_trials=2,
+            embed_max_epochs=3,
+            embed_patience=2,
+            classical_hpo_max_trials=3,
+        ),
+        run_config=RunConfig(
+            master_seed=42, device="cpu",
+            output_dir=tmpdir, dataset_id="label_test",
+        ),
+    )
+    model.fit(df, y)
+    preds = model.predict(df)
+
+    unique_preds = set(preds)
+    print(f"Original labels: {set(y)}")
+    print(f"Predicted labels: {unique_preds}")
+
+    assert unique_preds.issubset({"positive", "negative"}), (
+        f"Predictions should be original string labels, got {unique_preds}"
+    )
+    print("Test passed: classification predictions use original labels")

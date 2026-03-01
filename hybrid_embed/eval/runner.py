@@ -402,11 +402,14 @@ class HybridTabularModel:
         Returns
         -------
         np.ndarray
-            Predicted labels (classification) or values (regression).
+            Predicted labels (classification) or values (regression),
+            in the same scale / label space as the original ``y``
+            passed to ``fit()``.
         """
         self._check_fitted()
         E = self._get_embeddings(X)
-        return self._classical_model.predict(E)
+        preds = self._classical_model.predict(E)
+        return self._preprocessor.inverse_transform_target(preds)
 
     def predict_proba(self, X: pd.DataFrame) -> np.ndarray:
         """Predict class probabilities (classification only).

@@ -405,18 +405,8 @@ def evaluate_oos_regression(model, X_oos, y_oos):
     print(f"  NN-only   RMSE: {nn_rmse:.4f}   MAE: {nn_mae:.4f}   "
           f"R2: {nn_r2:.4f}")
 
-    # Hybrid: predict() returns predictions in original target space
-    # because the classical model was trained on scaled embeddings but
-    # its target is already in the preprocessor's scaled space; however
-    # the HybridTabularModel does NOT inverse-transform internally.
-    # The classical model predicts in the same space it was trained on
-    # (the preprocessor's target space), so we inverse-transform here.
-    hybrid_preds_scaled = model._classical_model.predict(
-        model._get_embeddings(X_oos)
-    )
-    hybrid_preds = model._preprocessor.inverse_transform_target(
-        hybrid_preds_scaled
-    )
+    # Hybrid: predict() returns predictions in the original target scale.
+    hybrid_preds = model.predict(X_oos)
 
     hybrid_rmse = float(np.sqrt(mean_squared_error(y_oos, hybrid_preds)))
     hybrid_mae = float(mean_absolute_error(y_oos, hybrid_preds))
