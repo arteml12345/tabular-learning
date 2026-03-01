@@ -1,6 +1,7 @@
 """Tests for hybrid_embed.classical.model_zoo."""
 
 import numpy as np
+from sklearn.metrics import r2_score, roc_auc_score
 from sklearn.neighbors import KNeighborsClassifier
 from hyperopt import hp
 
@@ -264,3 +265,81 @@ def test_train_custom_model():
     print(f"KNN predictions shape: {preds.shape}")
     assert preds.shape == (50,)
     print("Test passed: custom model trains and predicts correctly")
+
+
+# ==========================================================================
+# Sanity tests: random labels should NOT produce predictive models
+# ==========================================================================
+
+def test_xgboost_random_labels_no_leakage():
+    """XGBoost on random binary labels should stay near chance."""
+    import xgboost
+    rng = np.random.RandomState(42)
+    E = rng.randn(400, 64).astype(np.float64)
+    y_random = rng.choice([0, 1], size=400).astype(int)
+
+    model = build_model(
+        xgboost.XGBClassifier,
+        {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.1},
+        task="binary",
+    )
+    trained = train_classical_model(
+        model, E[:300], y_random[:300],
+        E_val=E[300:], y_val=y_random[300:],
+        supports_early_stopping=True,
+    )
+    proba = trained.predict_proba(E[300:])[:, 1]
+    auc = roc_auc_score(y_random[300:], proba)
+    print(f"XGBoost random-label ROC-AUC: {auc:.4f}")
+    assert auc < 0.65, (
+        f"XGBoost should not learn from random labels; ROC-AUC={auc:.4f}"
+    )
+    print("Test passed: no leakage with XGBoost on random labels")
+
+
+def test_lightgbm_random_labels_no_leakage():
+    """LightGBM on random binary labels should stay near chance."""
+    import lightgbm
+    rng = np.random.RandomState(42)
+    E = rng.randn(400, 64).astype(np.float64)
+    y_random = rng.choice([0, 1], size=400).astype(int)
+
+    model = build_model(
+        lightgbm.LGBMClassifier,
+        {"n_estimators": 100, "max_depth": 4, "learning_rate": 0.1},
+        task="binary",
+    )
+    trained = train_classical_model(
+        model, E[:300], y_random[:300],
+        E_val=E[300:], y_val=y_random[300:],
+        supports_early_stopping=True,
+    )
+    proba = trained.predict_proba(E[300:])[:, 1]
+    auc = roc_auc_score(y_random[300:], proba)
+    print(f"LightGBM random-label ROC-AUC: {auc:.4f}")
+    assert auc < 0.65, (
+        f"LightGBM should not learn from random labels; ROC-AUC={auc:.4f}"
+    )
+    print("Test passed: no leakage with LightGBM on random labels")
+
+
+def test_random_forest_random_labels_no_leakage():
+    """RandomForest on random regression targets should have R^2 near 0."""
+    from sklearn.ensemble import RandomForestRegressor
+    rng = np.random.RandomState(42)
+    E = rng.randn(400, 64).astype(np.float64)
+    y_random = rng.randn(400).astype(np.float64)
+
+    model = build_model(
+        RandomForestRegressor,
+        {"n_estimators": 100, "max_depth": 5},
+        task="regression",
+    )
+    trained = train_classical_model(model, E[:300], y_random[:300])
+    preds = trained.predict(E[300:])
+    r2 = r2_score(y_random[300:], preds)
+    print(f"RandomForest random-label R^2: {r2:.4f}")
+    assert r2 < 0.15, (
+        f"RandomForest should not learn from random targets; R^2={r2:.4f}"
+    )
+    print("Test passed: no leakage with RandomForest on random labels")

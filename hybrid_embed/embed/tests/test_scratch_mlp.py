@@ -459,3 +459,68 @@ def test_mlp_regression_quality():
     print(f"Regression test R^2: {r2:.4f}")
     assert r2 > 0.80, f"Expected R^2 > 0.80, got {r2:.4f}"
     print("Test passed: MLP achieves strong regression performance")
+
+
+# ---------------------------------------------------------------------------
+# Sanity tests: random labels should NOT produce predictive models
+# ---------------------------------------------------------------------------
+
+
+def test_mlp_random_labels_binary_no_leakage():
+    """MLP on shuffled binary labels should stay near chance (ROC-AUC ~ 0.5)."""
+    seed_everything(42)
+    X, _ = _make_learnable_binary(n_samples=800)
+    rng = np.random.RandomState(99)
+    y_random = rng.choice([0, 1], size=800).astype(np.float32)
+
+    n_train, n_val = 500, 150
+    X_train = {k: v[:n_train] for k, v in X.items()}
+    X_val = {k: v[n_train:n_train + n_val] for k, v in X.items()}
+    X_test = {k: v[n_train + n_val:] for k, v in X.items()}
+    y_train = y_random[:n_train]
+    y_val = y_random[n_train:n_train + n_val]
+    y_test = y_random[n_train + n_val:]
+
+    model = MLPEmbeddingModel(
+        task="binary", n_numeric=5,
+        n_categories_per_column=[10, 5, 8], n_classes=2,
+    )
+    model.fit(X_train, y_train, X_val, y_val, _quality_config())
+
+    proba = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, proba)
+    print(f"Random-label binary ROC-AUC: {auc:.4f}")
+    assert auc < 0.65, (
+        f"Model should not learn from random labels; ROC-AUC={auc:.4f}"
+    )
+    print("Test passed: no leakage on random binary labels")
+
+
+def test_mlp_random_labels_regression_no_leakage():
+    """MLP on random regression targets should have R^2 near 0."""
+    seed_everything(42)
+    X, _ = _make_learnable_regression(n_samples=800)
+    rng = np.random.RandomState(99)
+    y_random = rng.randn(800).astype(np.float32)
+
+    n_train, n_val = 500, 150
+    X_train = {k: v[:n_train] for k, v in X.items()}
+    X_val = {k: v[n_train:n_train + n_val] for k, v in X.items()}
+    X_test = {k: v[n_train + n_val:] for k, v in X.items()}
+    y_train = y_random[:n_train]
+    y_val = y_random[n_train:n_train + n_val]
+    y_test = y_random[n_train + n_val:]
+
+    model = MLPEmbeddingModel(
+        task="regression", n_numeric=5,
+        n_categories_per_column=[5, 5], n_classes=None,
+    )
+    model.fit(X_train, y_train, X_val, y_val, _quality_config())
+
+    preds = model.predict(X_test).squeeze()
+    r2 = r2_score(y_test, preds)
+    print(f"Random-label regression R^2: {r2:.4f}")
+    assert r2 < 0.15, (
+        f"Model should not learn from random targets; R^2={r2:.4f}"
+    )
+    print("Test passed: no leakage on random regression labels")

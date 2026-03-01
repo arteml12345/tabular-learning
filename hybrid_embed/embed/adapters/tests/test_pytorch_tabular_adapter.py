@@ -455,3 +455,60 @@ def test_quality_multiclass():
     print(f"Multiclass accuracy: {acc:.4f}")
     assert acc > 0.85, f"Expected accuracy > 0.85, got {acc:.4f}"
     print("Test passed: multiclass model has predictive power")
+
+
+# ==========================================================================
+# Sanity tests: random labels should NOT produce predictive models
+# ==========================================================================
+
+
+def test_random_labels_category_embedding_no_leakage():
+    """CategoryEmbedding on shuffled labels should stay near chance."""
+    seed_everything(42)
+    X, _ = _make_learnable_binary(n_samples=800)
+    rng = np.random.RandomState(99)
+    y_random = rng.choice([0, 1], size=800).astype(np.float32)
+
+    Xt, yt, Xv, yv = _split(X, y_random, 500, 150)
+    X_test = {k: v[650:] for k, v in X.items()}
+    y_test = y_random[650:]
+
+    model = PytorchTabularEmbeddingModel(
+        model_type="category_embedding", task="binary",
+        schema=_SCHEMA_BINARY, n_classes=2,
+    )
+    model.fit(Xt, yt, Xv, yv, _quality_config("category_embedding"))
+
+    proba = model.predict_proba(X_test)[:, 1]
+    auc = roc_auc_score(y_test, proba)
+    print(f"Random-label CategoryEmbedding ROC-AUC: {auc:.4f}")
+    assert auc < 0.65, (
+        f"Model should not learn from random labels; ROC-AUC={auc:.4f}"
+    )
+    print("Test passed: no leakage on random binary labels")
+
+
+def test_random_labels_regression_no_leakage():
+    """CategoryEmbedding on random regression targets should have R^2 near 0."""
+    seed_everything(42)
+    X, _ = _make_learnable_regression(n_samples=800)
+    rng = np.random.RandomState(99)
+    y_random = rng.randn(800).astype(np.float32)
+
+    Xt, yt, Xv, yv = _split(X, y_random, 500, 150)
+    X_test = {k: v[650:] for k, v in X.items()}
+    y_test = y_random[650:]
+
+    model = PytorchTabularEmbeddingModel(
+        model_type="category_embedding", task="regression",
+        schema=_SCHEMA_REG, n_classes=None,
+    )
+    model.fit(Xt, yt, Xv, yv, _quality_config("category_embedding"))
+
+    preds = model.predict(X_test).squeeze()
+    r2 = r2_score(y_test, preds)
+    print(f"Random-label regression R^2: {r2:.4f}")
+    assert r2 < 0.15, (
+        f"Model should not learn from random targets; R^2={r2:.4f}"
+    )
+    print("Test passed: no leakage on random regression labels")
