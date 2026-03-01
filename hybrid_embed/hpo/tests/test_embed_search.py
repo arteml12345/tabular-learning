@@ -103,10 +103,13 @@ def _make_random_binary_data(
 
 def _train_with_defaults(X_train, y_train, X_val, y_val,
                          n_numeric, n_categories_per_column,
-                         task="binary", max_epochs=20):
+                         task="binary", max_epochs=20, seed=0):
     """Train MLP with default (non-tuned) params, return val metric."""
     from hybrid_embed.embed.scratch_mlp import MLPEmbeddingModel
     from hybrid_embed.eval.metrics import compute_metrics, get_primary_metric_name
+    from hybrid_embed.utils import seed_everything
+
+    seed_everything(seed)
 
     default_config = {
         "embedding_dim": 32,
@@ -421,10 +424,14 @@ def test_hpo_explores_diverse_configs():
 # =====================================================================
 
 def test_hpo_random_data_binary_no_leakage():
-    """On random labels, HPO best score should stay near chance (ROC-AUC ~0.5)."""
+    """On random labels, HPO best score should stay near chance (ROC-AUC ~0.5).
+
+    Uses large val set (200 samples) so AUC variance is low.
+    Asserts AUC stays in the coin-flip zone [0.35, 0.65].
+    """
     (X_tr, y_tr, X_v, y_v,
      n_num, n_cats) = _make_random_binary_data(
-        n_train=300, n_val=80, seed=99,
+        n_train=500, n_val=200, seed=99,
     )
 
     step = EmbeddingStepConfig(model_type="mlp")
@@ -443,22 +450,27 @@ def test_hpo_random_data_binary_no_leakage():
     )
     hpo_score = result["best_score"]
     print(f"Random-data HPO best ROC-AUC: {hpo_score:.4f}")
-    assert hpo_score < 0.65, (
-        f"HPO should not find signal in random labels; ROC-AUC={hpo_score:.4f}"
+    assert 0.35 <= hpo_score <= 0.65, (
+        f"HPO on random labels should stay in coin-flip zone [0.35, 0.65]; "
+        f"got ROC-AUC={hpo_score:.4f}"
     )
     print("Test passed: no leakage with HPO on random binary labels")
 
 
 def test_hpo_no_significant_improvement_on_random_data():
-    """HPO on random data: best trial should not be much better than default."""
+    """HPO on random data: best trial should not be much better than default.
+
+    Both default and HPO are seeded deterministically.
+    Improvement on random data should stay below 0.10.
+    """
     (X_tr, y_tr, X_v, y_v,
      n_num, n_cats) = _make_random_binary_data(
-        n_train=300, n_val=80, seed=99,
+        n_train=500, n_val=200, seed=99,
     )
 
     default_score = _train_with_defaults(
         X_tr, y_tr, X_v, y_v, n_num, n_cats,
-        task="binary", max_epochs=10,
+        task="binary", max_epochs=10, seed=99,
     )
     print(f"Random-data default ROC-AUC: {default_score:.4f}")
 
@@ -481,7 +493,7 @@ def test_hpo_no_significant_improvement_on_random_data():
     print(f"Random-data HPO best ROC-AUC: {hpo_score:.4f}")
     print(f"Improvement over default: {improvement:+.4f}")
 
-    assert improvement < 0.15, (
+    assert improvement < 0.10, (
         f"HPO should not significantly improve on random data; "
         f"improvement={improvement:+.4f}"
     )

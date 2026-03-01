@@ -102,6 +102,9 @@ def hyperopt_search_embedding(
         trial_id = trial_counter[0]
         trial_counter[0] += 1
 
+        from hybrid_embed.utils import seed_everything
+        seed_everything(master_seed + trial_id)
+
         params = _postprocess(sampled_params, model_type)
         params.update(fixed_params)
         params["max_epochs"] = max_epochs
