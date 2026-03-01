@@ -276,8 +276,14 @@ class MLPEmbeddingModel(EmbeddingModel):
         ).to(self._device)
 
         resolved_layer = embedding_layer
+        n_layers = len(hidden_dims)
         if resolved_layer < 0:
-            resolved_layer = len(hidden_dims) + resolved_layer
+            resolved_layer = n_layers + resolved_layer
+        if resolved_layer < 0 or resolved_layer >= n_layers:
+            raise ValueError(
+                f"embedding_layer={embedding_layer} is out of range for "
+                f"{n_layers} hidden layers (valid: -{n_layers} to {n_layers - 1})"
+            )
         self.embedding_dim = hidden_dims[resolved_layer]
 
         loss_fn = self._get_loss_fn()
@@ -394,8 +400,11 @@ class MLPEmbeddingModel(EmbeddingModel):
         numeric = torch.tensor(X["numeric"], dtype=torch.float32)
         categorical = torch.tensor(X["categorical"], dtype=torch.long)
 
-        parts = []
         n = len(numeric)
+        if n == 0:
+            return np.empty((0, self.embedding_dim), dtype=np.float32)
+
+        parts = []
         with torch.no_grad():
             for start in range(0, n, _ENCODE_BATCH_SIZE):
                 end = min(start + _ENCODE_BATCH_SIZE, n)
@@ -591,8 +600,12 @@ class MLPEmbeddingModel(EmbeddingModel):
         numeric = torch.tensor(X["numeric"], dtype=torch.float32)
         categorical = torch.tensor(X["categorical"], dtype=torch.long)
 
-        parts = []
         n = len(numeric)
+        if n == 0:
+            out_dim = self.n_classes if self.task == "multiclass" else 1
+            return np.empty((0, out_dim), dtype=np.float32)
+
+        parts = []
         with torch.no_grad():
             for start in range(0, n, _ENCODE_BATCH_SIZE):
                 end = min(start + _ENCODE_BATCH_SIZE, n)

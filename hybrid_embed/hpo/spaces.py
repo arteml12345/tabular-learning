@@ -52,6 +52,7 @@ def _tab_transformer_space() -> dict:
         "num_heads": hp.choice("num_heads", [2, 4, 8]),
         "num_attn_blocks": hp.quniform("num_attn_blocks", 2, 6, 1),
         "attn_dropout": hp.uniform("attn_dropout", 0, 0.3),
+        "ff_dropout": hp.uniform("ff_dropout", 0, 0.3),
         "add_shared_embedding": hp.choice("add_shared_embedding", [True, False]),
         "shared_embedding_fraction": hp.uniform("shared_embedding_fraction", 0.25, 0.75),
         "lr": hp.loguniform("lr", np.log(1e-5), np.log(1e-3)),
