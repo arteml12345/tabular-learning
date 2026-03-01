@@ -212,3 +212,5 @@ tempfiles/
 
 # Project-specific
 runs/
+lightning_logs/
+.pt_tmp/
