@@ -214,3 +214,4 @@ tempfiles/
 runs/
 lightning_logs/
 .pt_tmp/
+catboost_info/
