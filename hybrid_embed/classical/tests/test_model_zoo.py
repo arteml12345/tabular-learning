@@ -252,6 +252,38 @@ def test_train_ridge():
     print("Test passed: Ridge trains and predicts correctly")
 
 
+def test_train_ridge_classifier():
+    """Ridge resolved for classification should use LogisticRegression with predict_proba."""
+    config = ClassicalStepConfig(model_type="ridge")
+    spec = resolve_classical_step(config, task="binary")
+    E, y_bin, _, _ = _make_embedding_data()
+    model = build_model(spec["class"], spec["params"], task="binary")
+    trained = train_classical_model(model, E[:150], y_bin[:150])
+    preds = trained.predict(E[150:])
+    proba = trained.predict_proba(E[150:])
+    print(f"Ridge-clf class: {type(trained).__name__}")
+    print(f"Ridge-clf predictions shape: {preds.shape}, proba shape: {proba.shape}")
+    assert preds.shape == (50,)
+    assert proba.shape == (50, 2)
+    print("Test passed: ridge resolves to proper classifier with predict_proba")
+
+
+def test_train_elastic_net_classifier():
+    """ElasticNet resolved for classification should use SGDClassifier with predict_proba."""
+    config = ClassicalStepConfig(model_type="elastic_net")
+    spec = resolve_classical_step(config, task="binary")
+    E, y_bin, _, _ = _make_embedding_data()
+    model = build_model(spec["class"], spec["params"], task="binary")
+    trained = train_classical_model(model, E[:150], y_bin[:150])
+    preds = trained.predict(E[150:])
+    proba = trained.predict_proba(E[150:])
+    print(f"ElasticNet-clf class: {type(trained).__name__}")
+    print(f"ElasticNet-clf predictions shape: {preds.shape}, proba shape: {proba.shape}")
+    assert preds.shape == (50,)
+    assert proba.shape == (50, 2)
+    print("Test passed: elastic_net resolves to proper classifier with predict_proba")
+
+
 def test_train_custom_model():
     """Custom model should train and predict correctly."""
     E, y_bin, _, _ = _make_embedding_data()

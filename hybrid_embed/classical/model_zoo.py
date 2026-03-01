@@ -27,13 +27,26 @@ def _logistic_regression_space() -> dict:
     }
 
 
-def _ridge_space() -> dict:
+def _ridge_clf_space() -> dict:
+    return {
+        "C": hp.loguniform("C", np.log(1e-4), np.log(1e2)),
+    }
+
+
+def _ridge_reg_space() -> dict:
     return {
         "alpha": hp.loguniform("alpha", np.log(1e-4), np.log(1e4)),
     }
 
 
-def _elastic_net_space() -> dict:
+def _elastic_net_clf_space() -> dict:
+    return {
+        "alpha": hp.loguniform("alpha", np.log(1e-4), np.log(1e2)),
+        "l1_ratio": hp.uniform("l1_ratio", 0.01, 0.99),
+    }
+
+
+def _elastic_net_reg_space() -> dict:
     return {
         "alpha": hp.loguniform("alpha", np.log(1e-4), np.log(1e2)),
         "l1_ratio": hp.uniform("l1_ratio", 0.0, 1.0),
@@ -107,6 +120,7 @@ def _build_registry() -> dict:
         ElasticNet,
         LogisticRegression,
         Ridge,
+        SGDClassifier,
     )
 
     import catboost
@@ -117,57 +131,77 @@ def _build_registry() -> dict:
         "logistic_regression": {
             "class_clf": LogisticRegression,
             "class_reg": Ridge,
-            "default_params": {"max_iter": 1000},
-            "default_search_space_fn": _logistic_regression_space,
+            "default_params_clf": {"max_iter": 1000},
+            "default_params_reg": {},
+            "default_search_space_fn_clf": _logistic_regression_space,
+            "default_search_space_fn_reg": _ridge_reg_space,
             "supports_early_stopping": False,
         },
         "ridge": {
-            "class_clf": Ridge,
+            "class_clf": LogisticRegression,
             "class_reg": Ridge,
-            "default_params": {},
-            "default_search_space_fn": _ridge_space,
+            "default_params_clf": {"max_iter": 1000},
+            "default_params_reg": {},
+            "default_search_space_fn_clf": _ridge_clf_space,
+            "default_search_space_fn_reg": _ridge_reg_space,
             "supports_early_stopping": False,
         },
         "elastic_net": {
-            "class_clf": ElasticNet,
+            "class_clf": SGDClassifier,
             "class_reg": ElasticNet,
-            "default_params": {"max_iter": 1000},
-            "default_search_space_fn": _elastic_net_space,
+            "default_params_clf": {
+                "loss": "log_loss",
+                "penalty": "elasticnet",
+                "max_iter": 2000,
+            },
+            "default_params_reg": {"max_iter": 1000},
+            "default_search_space_fn_clf": _elastic_net_clf_space,
+            "default_search_space_fn_reg": _elastic_net_reg_space,
             "supports_early_stopping": False,
         },
         "random_forest": {
             "class_clf": RandomForestClassifier,
             "class_reg": RandomForestRegressor,
-            "default_params": {},
-            "default_search_space_fn": _random_forest_space,
+            "default_params_clf": {},
+            "default_params_reg": {},
+            "default_search_space_fn_clf": _random_forest_space,
+            "default_search_space_fn_reg": _random_forest_space,
             "supports_early_stopping": False,
         },
         "extra_trees": {
             "class_clf": ExtraTreesClassifier,
             "class_reg": ExtraTreesRegressor,
-            "default_params": {},
-            "default_search_space_fn": _extra_trees_space,
+            "default_params_clf": {},
+            "default_params_reg": {},
+            "default_search_space_fn_clf": _extra_trees_space,
+            "default_search_space_fn_reg": _extra_trees_space,
             "supports_early_stopping": False,
         },
         "xgboost": {
             "class_clf": xgboost.XGBClassifier,
             "class_reg": xgboost.XGBRegressor,
-            "default_params": {"verbosity": 0},
-            "default_search_space_fn": _xgboost_space,
+            "default_params_clf": {"verbosity": 0},
+            "default_params_reg": {"verbosity": 0},
+            "default_search_space_fn_clf": _xgboost_space,
+            "default_search_space_fn_reg": _xgboost_space,
             "supports_early_stopping": True,
         },
         "lightgbm": {
             "class_clf": lightgbm.LGBMClassifier,
             "class_reg": lightgbm.LGBMRegressor,
-            "default_params": {"verbose": -1},
-            "default_search_space_fn": _lightgbm_space,
+            "default_params_clf": {"verbose": -1},
+            "default_params_reg": {"verbose": -1},
+            "default_search_space_fn_clf": _lightgbm_space,
+            "default_search_space_fn_reg": _lightgbm_space,
             "supports_early_stopping": True,
         },
         "catboost": {
             "class_clf": catboost.CatBoostClassifier,
             "class_reg": catboost.CatBoostRegressor,
-            "default_params": {"verbose": 0},
-            "default_search_space_fn": _catboost_space,
+            "default_params_clf": {"verbose": 0},
+            "default_params_reg": {"verbose": 0},
+            "default_search_space_fn_clf": _catboost_space,
+            "default_search_space_fn_reg": _catboost_space,
             "supports_early_stopping": True,
         },
     }
@@ -242,16 +276,17 @@ def resolve_classical_step(
     entry = registry[step_config.model_type]
 
     is_reg = task == "regression"
+    suffix = "_reg" if is_reg else "_clf"
     model_class = entry["class_reg"] if is_reg else entry["class_clf"]
 
-    params = dict(entry["default_params"])
+    params = dict(entry[f"default_params{suffix}"])
     if step_config.fixed_params:
         params.update(step_config.fixed_params)
 
     search_space = (
         step_config.search_space
         if step_config.search_space is not None
-        else entry["default_search_space_fn"]()
+        else entry[f"default_search_space_fn{suffix}"]()
     )
 
     supports_es = (
